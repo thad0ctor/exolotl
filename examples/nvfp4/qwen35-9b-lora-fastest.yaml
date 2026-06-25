@@ -1,0 +1,87 @@
+# Fastest native NVFP4 training path for Qwen3.5-9B LoRA on Blackwell.
+#
+# Target shape: text-only SFT, sequence_len 2048, sample packing, no gradient
+# checkpointing, on a 96GB Blackwell card (sm_100 / sm_120).
+#
+# base_mode: compute pre-quantizes the frozen base into the two NVFP4 layouts so
+# fprop and dgrad run as pure FP4 GEMMs with no per-step base-quant prologue. The
+# lm_head stays bf16 (excluded) and frozen under LoRA, so lm_head_cross_entropy:
+# auto resolves to the chunked bf16 CE kernel — convergence-safe (CCE / Liger
+# fused-linear CE loss-collapse under NVFP4 SR grads) and skips materializing the
+# [tokens, vocab] logits. Use bf16 (not fp16) on Blackwell.
+base_model: Qwen/Qwen3.5-9B
+model_config_type: qwen3_5
+strict: false
+
+chat_template: qwen3_5
+datasets:
+  - path: yahma/alpaca-cleaned
+    type: alpaca
+val_set_size: 0.0
+dataset_prepared_path: /tmp/axolotl_nvfp4_qwen35_fastest_prepared
+output_dir: /tmp/axolotl_nvfp4_qwen35_fastest_out
+
+sequence_len: 2048
+sample_packing: true
+pad_to_sequence_len: true
+
+load_in_8bit: false
+load_in_4bit: false
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  - linear_attn.in_proj_qkv
+  - linear_attn.in_proj_z
+  - linear_attn.out_proj
+
+gradient_accumulation_steps: 1
+# Targets a 96GB Blackwell card. Reduce micro_batch_size on smaller cards or
+# enable gradient_checkpointing if you need memory headroom.
+micro_batch_size: 4
+num_epochs: 1
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+learning_rate: 2.0e-4
+max_grad_norm: 1.0
+
+bf16: true
+fp16: false
+tf32: true
+torch_compile: true
+
+gradient_checkpointing: false
+attn_implementation: flash_attention_2
+
+nvfp4_training:
+  enabled: true
+  base_mode: compute
+  stochastic_rounding: true
+  hadamard: true
+  exclude_modules: [lm_head, embed_tokens]
+  skip_first_n_blocks: 0
+  skip_last_n_blocks: 0
+  fuse_rmsnorm: false
+  # Reuse one NVFP4 activation pack across fused LoRA QKV/QK base fprops. Try true
+  # on models with more full-attention LoRA layers.
+  shared_lora_base_fprop: false
+  # Head-aware fused CE: bf16 head here -> chunked bf16 kernel (skips logits).
+  lm_head_cross_entropy: auto
+  # Vocab tile width (speed<->VRAM dial, loss-invariant); default 4096 is lighter.
+  fused_ce_vocab_block: 8192
+
+warmup_steps: 10
+logging_steps: 1
+save_strategy: "no"
+saves_per_epoch:
+evals_per_epoch:
+weight_decay: 0.0
+special_tokens:

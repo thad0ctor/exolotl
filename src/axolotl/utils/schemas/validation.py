@@ -1024,6 +1024,31 @@ class OptimizationValidationMixin:
                 "liger_fused_linear_cross_entropy"
             ),
         }
+        nvfp4 = data.get("nvfp4_training") or {}
+
+        def _nvfp4_get(key):
+            if isinstance(nvfp4, dict):
+                return nvfp4.get(key)
+            return getattr(nvfp4, key, None)
+
+        nvfp4_enabled = _nvfp4_get("enabled")
+        # Resolve the unified flag (the nested validator hasn't run at mode="before",
+        # so honor the deprecated booleans here too).
+        ce_mode = _nvfp4_get("lm_head_cross_entropy") or "off"
+        if ce_mode == "off":
+            if _nvfp4_get("fused_fp4_cross_entropy"):
+                ce_mode = "fp4"
+            elif _nvfp4_get("bf16_lm_head_cross_entropy"):
+                ce_mode = "bf16"
+            elif _nvfp4_get("fp8_lm_head_cross_entropy"):
+                ce_mode = "fp8"
+        # The fp4 kernel reads the NVFP4-packed head and supersedes cut_cross_entropy,
+        # so it doesn't collide; bf16/fp8 patch a plain-Linear loss and do.
+        fp4_like = ce_mode == "fp4" or (
+            ce_mode == "auto" and _nvfp4_get("quantize_lm_head")
+        )
+        if nvfp4_enabled and ce_mode != "off" and not fp4_like:
+            ce_options["nvfp4_training.lm_head_cross_entropy"] = True
 
         enabled_options = [k for k, v in ce_options.items() if v]
 

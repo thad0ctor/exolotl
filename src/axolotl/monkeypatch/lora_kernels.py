@@ -560,6 +560,7 @@ def apply_lora_kernel_patches(
                 )
 
                 if can_patch_qkv:
+                    self_attn._lora_batch_kernel = bool(cfg.lora_batch_kernel)
                     if has_v_proj:
                         self_attn.apply_qkv = types.MethodType(
                             apply_lora_qkv, self_attn
@@ -633,6 +634,7 @@ def apply_lora_kernel_patches(
                 )
 
                 if can_patch_mlp:
+                    mlp._lora_batch_kernel = bool(cfg.lora_batch_kernel)
                     apply_fn = APPLY_FN_MAPPING[activation]
                     layer.mlp.forward = types.MethodType(apply_fn, mlp)
                 else:
