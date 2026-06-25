@@ -1,16 +1,13 @@
 """Tests for the Gemma 4 hybrid-attention mask fix.
 
-These tests pin the single critical behavior: after installing the patch,
-``modeling_gemma4.create_causal_mask`` passes an SDPA-overridden config to
-the underlying mask builder regardless of what the caller's config says.
-This is what keeps full-attention (head_dim=512) global layers from
-crashing at long sequence lengths — they need a 4D SDPA-format mask, not
-the 2D FA2 mask that would be built from the model-level config.
-
-The tests use a mocked ``create_causal_mask`` so they don't have to load
-a real 26B Gemma 4 model or even have access to its weights. What matters
-for the bug fix is which config is handed to the mask factory, not the
-factory's actual output.
+Pin that the patched mask builders pass an SDPA-overridden config to the
+underlying factory, so full-attention global layers receive a 4D mask
+instead of the 2D FA2 mask the model-level config would produce. Two
+entry points must be covered: ``create_causal_mask`` (text-only path,
+plus transitive coverage of ``create_causal_mask_mapping``) and
+``create_masks_for_generate`` (multimodal non-vision branch — its
+dispatch lives in ``masking_utils`` so the ``create_causal_mask`` rebind
+doesn't reach it).
 """
 
 from types import SimpleNamespace
@@ -26,17 +23,38 @@ pytest.importorskip(
 
 @pytest.fixture
 def restore_gemma4_module():
-    """Snapshot ``modeling_gemma4.create_causal_mask`` and restore after
-    each test so patch state doesn't leak across the suite."""
+    """Snapshot patch-target symbols across all variants and restore after each test."""
+    import importlib
+
     from transformers.models.gemma4 import modeling_gemma4
 
-    saved = modeling_gemma4.create_causal_mask
-    yield modeling_gemma4
-    modeling_gemma4.create_causal_mask = saved
-    # Reset the module-level flag so the next test can re-install cleanly.
     from axolotl.monkeypatch import gemma4_hybrid_mask
 
+    _MISSING = object()
+    snapshots: dict = {}
+    for module_path in gemma4_hybrid_mask._TARGET_MODULES:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        snapshots[module] = {
+            name: getattr(module, name, _MISSING)
+            for name in gemma4_hybrid_mask._WRAPPED_SYMBOLS
+        }
+    yield modeling_gemma4
+    for module, names in snapshots.items():
+        for name, original in names.items():
+            if original is _MISSING:
+                if hasattr(module, name):
+                    delattr(module, name)
+            else:
+                setattr(module, name, original)
     gemma4_hybrid_mask._PATCH_APPLIED = False
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: create_causal_mask wrapper
+# ---------------------------------------------------------------------------
 
 
 def test_patch_replaces_create_causal_mask(restore_gemma4_module):
@@ -68,24 +86,16 @@ def test_patch_is_idempotent(restore_gemma4_module):
 
 
 def test_patched_mask_forces_sdpa_config(restore_gemma4_module):
-    """Core invariant: when the patched wrapper is called with a config
-    that says ``flash_attention_2``, the underlying mask factory receives
-    a shallow-copied config whose ``_attn_implementation`` is ``"sdpa"``.
-
-    Without this, the full-attention global layers get a 2D FA2 mask and
-    crash at long seq lens with the [B, H, S, S] / [B, S] expand error.
-    """
+    """Core invariant: caller's FA2 config must reach the factory as SDPA
+    on a shallow copy, leaving the caller's config untouched."""
     modeling_gemma4 = restore_gemma4_module
     from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
 
-    # Swap in a mock BEFORE installing the patch so the wrapper captures
-    # it as the "original". The mock records every call so we can inspect
-    # what config got passed through.
+    # Mock must be installed before the patch so it gets captured as original.
     mock_factory = MagicMock(name="create_causal_mask", return_value="mask_4d")
     modeling_gemma4.create_causal_mask = mock_factory
     patch_gemma4_hybrid_mask()
 
-    # Caller-supplied config says FA2 (that's the model-level setting).
     caller_config = SimpleNamespace(
         _attn_implementation="flash_attention_2",
         head_dim=512,
@@ -99,31 +109,18 @@ def test_patched_mask_forces_sdpa_config(restore_gemma4_module):
         position_ids=None,
     )
 
-    # Wrapper returned whatever the mock returned — no transformation of
-    # the result itself.
     assert result == "mask_4d"
-
-    # The mock was called exactly once with a config whose
-    # ``_attn_implementation`` is sdpa, NOT the caller's fa2.
     assert mock_factory.call_count == 1
     (passed_config, *_), passed_kwargs = mock_factory.call_args
     assert passed_config._attn_implementation == "sdpa"
-
-    # The wrapper must NOT mutate the caller's config in place — other
-    # mask builders (e.g. create_sliding_window_causal_mask) read from
-    # the same config and must still see fa2.
+    # Caller's config untouched — other builders share it and need FA2.
     assert caller_config._attn_implementation == "flash_attention_2"
-
-    # Other attributes on the config must be preserved so the underlying
-    # factory has everything it needs (head_dim, rope_theta, vocab_size, ...).
     assert passed_config.head_dim == 512
     assert passed_config.some_other_attr == "preserved"
 
 
 def test_patched_wrapper_passes_through_all_kwargs(restore_gemma4_module):
-    """The wrapper must forward positional + keyword args to the original
-    unchanged, so transformers' own call-site in Gemma4TextModel.forward
-    keeps working across minor transformers-version signature drift."""
+    """Forward args/kwargs unchanged so we survive transformers signature drift."""
     modeling_gemma4 = restore_gemma4_module
     from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
 
@@ -143,9 +140,7 @@ def test_patched_wrapper_passes_through_all_kwargs(restore_gemma4_module):
     )
 
     args, kwargs = mock_factory.call_args
-    # First positional (after config override) is preserved.
     assert args[1] == "positional_arg"
-    # All kwargs are forwarded untouched.
     assert kwargs["inputs_embeds"] == "embeds"
     assert kwargs["attention_mask"] == "mask_2d"
     assert kwargs["past_key_values"] == "cache"
@@ -172,15 +167,12 @@ def test_unpatch_restores_original(restore_gemma4_module):
 def test_unpatch_is_safe_without_prior_patch(restore_gemma4_module):
     from axolotl.monkeypatch.gemma4_hybrid_mask import unpatch_gemma4_hybrid_mask
 
-    # Should be a no-op, no exception.
     unpatch_gemma4_hybrid_mask()
 
 
 def test_sliding_window_mask_builder_is_not_patched(restore_gemma4_module):
-    """Only ``create_causal_mask`` is overridden — the sliding-window
-    factory must remain bound to its original to preserve FA2 masks for
-    the sliding-attention layers. If we accidentally patch both, the
-    sliding layers get SDPA format and lose the FA2 speedup."""
+    """Sliding-window factory must stay unwrapped so sliding layers keep
+    FA2 masks (and the FA2 speedup)."""
     modeling_gemma4 = restore_gemma4_module
     from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
 
@@ -194,21 +186,264 @@ def test_sliding_window_mask_builder_is_not_patched(restore_gemma4_module):
 
 
 # ---------------------------------------------------------------------------
-# Integration tests with a tiny randomly-initialized Gemma4TextModel.
-#
-# These do NOT load real 26B weights. They build a ~350k-param Gemma 4 text
-# model with 2 layers (one sliding, one full_attention), apply the hybrid
-# attention path end-to-end, and run a forward pass with a padded
-# attention_mask at a long-ish seq len. The invariant we're pinning is that
-# the full_attention layer does not crash with the
-#   "Target sizes: [B, H, S, S]. Tensor sizes: [B, S]"
-# error — the exact failure that blew up the Gemma 4 MoE 26B pilot at ~7k
-# tokens in the FSDP2 training run.
+# Unit tests: create_masks_for_generate wrapper (multimodal forward path)
+# ---------------------------------------------------------------------------
+
+
+def test_patch_replaces_create_masks_for_generate(restore_gemma4_module):
+    """Multimodal non-vision forward goes through this symbol; without a
+    wrapper its ``full_attention`` entry is 2D and the SDPA layers crash."""
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    if not hasattr(modeling_gemma4, "create_masks_for_generate"):
+        pytest.skip(
+            "transformers version has no modeling_gemma4.create_masks_for_generate"
+        )
+
+    original = modeling_gemma4.create_masks_for_generate
+    assert patch_gemma4_hybrid_mask() is True
+
+    assert modeling_gemma4.create_masks_for_generate is not original
+    assert modeling_gemma4.create_masks_for_generate._axolotl_original is original, (
+        "patched wrapper must expose the original reference for teardown"
+    )
+
+
+def test_create_masks_for_generate_wrapper_replaces_full_attention_only(
+    restore_gemma4_module,
+):
+    """Wrapper rebuilds only ``full_attention`` from an SDPA call, keeps
+    every other key from the FA2 call. Caller's config must not mutate."""
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    if not hasattr(modeling_gemma4, "create_masks_for_generate"):
+        pytest.skip("transformers version lacks create_masks_for_generate")
+
+    sdpa_full_mask = "sdpa_full_4d_sentinel"
+    fa2_full_mask = "fa2_full_2d_sentinel"
+    fa2_sliding_mask = "fa2_sliding_2d_sentinel"
+    sdpa_sliding_mask = "sdpa_sliding_4d_sentinel"
+
+    def fake_original(config, *args, **kwargs):
+        if config._attn_implementation == "sdpa":
+            return {
+                "full_attention": sdpa_full_mask,
+                "sliding_attention": sdpa_sliding_mask,
+            }
+        return {
+            "full_attention": fa2_full_mask,
+            "sliding_attention": fa2_sliding_mask,
+        }
+
+    mock_original = MagicMock(side_effect=fake_original)
+    modeling_gemma4.create_masks_for_generate = mock_original
+    patch_gemma4_hybrid_mask()
+
+    caller_config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    result = modeling_gemma4.create_masks_for_generate(
+        caller_config,
+        inputs_embeds=None,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=None,
+    )
+
+    assert result == {
+        "full_attention": sdpa_full_mask,
+        "sliding_attention": fa2_sliding_mask,
+    }
+    assert mock_original.call_count == 2
+    assert caller_config._attn_implementation == "flash_attention_2"
+
+
+def test_create_masks_for_generate_wrapper_passes_through_non_dict(
+    restore_gemma4_module,
+):
+    """Non-dict return (no ``layer_types``) is passed through; no SDPA shadow call."""
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    if not hasattr(modeling_gemma4, "create_masks_for_generate"):
+        pytest.skip("transformers version lacks create_masks_for_generate")
+
+    sentinel = "single_tensor_passthrough"
+    mock_original = MagicMock(return_value=sentinel)
+    modeling_gemma4.create_masks_for_generate = mock_original
+    patch_gemma4_hybrid_mask()
+
+    caller_config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    result = modeling_gemma4.create_masks_for_generate(
+        caller_config,
+        inputs_embeds=None,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=None,
+    )
+
+    assert result is sentinel
+    assert mock_original.call_count == 1
+
+
+def test_create_masks_for_generate_wrapper_passes_through_when_no_full_key(
+    restore_gemma4_module,
+):
+    """No ``full_attention`` key (all-sliding model) → no second call."""
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    if not hasattr(modeling_gemma4, "create_masks_for_generate"):
+        pytest.skip("transformers version lacks create_masks_for_generate")
+
+    fa2_only = {"sliding_attention": "fa2_sliding"}
+    mock_original = MagicMock(return_value=fa2_only)
+    modeling_gemma4.create_masks_for_generate = mock_original
+    patch_gemma4_hybrid_mask()
+
+    caller_config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    result = modeling_gemma4.create_masks_for_generate(
+        caller_config,
+        inputs_embeds=None,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=None,
+    )
+
+    assert result == fa2_only
+    assert mock_original.call_count == 1
+
+
+def test_unpatch_restores_create_masks_for_generate(restore_gemma4_module):
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch.gemma4_hybrid_mask import (
+        patch_gemma4_hybrid_mask,
+        unpatch_gemma4_hybrid_mask,
+    )
+
+    if not hasattr(modeling_gemma4, "create_masks_for_generate"):
+        pytest.skip("transformers version lacks create_masks_for_generate")
+
+    sentinel = MagicMock(name="original_cmfg")
+    modeling_gemma4.create_masks_for_generate = sentinel
+    patch_gemma4_hybrid_mask()
+    assert modeling_gemma4.create_masks_for_generate is not sentinel
+
+    unpatch_gemma4_hybrid_mask()
+    assert modeling_gemma4.create_masks_for_generate is sentinel
+
+
+def test_create_masks_for_generate_wrapper_passes_through_when_sdpa_returns_non_dict(
+    restore_gemma4_module,
+):
+    """Defensive bail-out: SDPA call returning non-dict → keep FA2 output."""
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    if not hasattr(modeling_gemma4, "create_masks_for_generate"):
+        pytest.skip("transformers version lacks create_masks_for_generate")
+
+    fa2_dict = {"full_attention": "fa2_full", "sliding_attention": "fa2_sliding"}
+
+    def fake_original(config, *args, **kwargs):
+        if config._attn_implementation == "sdpa":
+            return "unexpected_non_dict_return"
+        return fa2_dict
+
+    mock_original = MagicMock(side_effect=fake_original)
+    modeling_gemma4.create_masks_for_generate = mock_original
+    patch_gemma4_hybrid_mask()
+
+    caller_config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    result = modeling_gemma4.create_masks_for_generate(
+        caller_config,
+        inputs_embeds=None,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=None,
+    )
+
+    assert result == fa2_dict
+
+
+# ---------------------------------------------------------------------------
+# Patch lifecycle / state-management tests
+# ---------------------------------------------------------------------------
+
+
+def test_patch_skips_symbols_missing_on_older_transformers(restore_gemma4_module):
+    """Missing symbol on older transformers → skip wrapper, still return True."""
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch import gemma4_hybrid_mask
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    if hasattr(modeling_gemma4, "create_masks_for_generate"):
+        delattr(modeling_gemma4, "create_masks_for_generate")
+
+    assert patch_gemma4_hybrid_mask() is True
+    assert gemma4_hybrid_mask._is_axolotl_wrapper(modeling_gemma4.create_causal_mask)
+    assert not hasattr(modeling_gemma4, "create_masks_for_generate")
+
+
+def test_patch_returns_false_when_no_symbols_present(restore_gemma4_module):
+    """All symbols missing → install reports failure so caller knows fix is inactive."""
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    for name in ("create_causal_mask", "create_masks_for_generate"):
+        if hasattr(modeling_gemma4, name):
+            delattr(modeling_gemma4, name)
+
+    assert patch_gemma4_hybrid_mask() is False
+
+
+def test_patch_is_idempotent_when_flag_lost_but_wrapper_already_bound(
+    restore_gemma4_module,
+):
+    """Flag reset but wrappers still bound → re-patch reports success and must
+    not re-wrap an existing wrapper (no double-wrapping)."""
+    from axolotl.monkeypatch import gemma4_hybrid_mask
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    modeling_gemma4 = restore_gemma4_module
+    patch_gemma4_hybrid_mask()
+    wrapped = modeling_gemma4.create_causal_mask
+    assert gemma4_hybrid_mask._is_axolotl_wrapper(wrapped)
+
+    # Simulate a fixture clearing the flag without restoring bindings.
+    gemma4_hybrid_mask._PATCH_APPLIED = False
+    assert patch_gemma4_hybrid_mask() is True
+
+    rewrapped = modeling_gemma4.create_causal_mask
+    assert rewrapped is wrapped, "re-patch must not wrap an existing wrapper"
+    assert rewrapped._axolotl_original is wrapped._axolotl_original
+
+
+def test_unpatch_leaves_third_party_rebindings_alone(restore_gemma4_module):
+    """Downstream replacement of our wrapper must survive unpatch."""
+    modeling_gemma4 = restore_gemma4_module
+    from axolotl.monkeypatch.gemma4_hybrid_mask import (
+        patch_gemma4_hybrid_mask,
+        unpatch_gemma4_hybrid_mask,
+    )
+
+    patch_gemma4_hybrid_mask()
+    third_party = MagicMock(name="downstream_replacement")
+    modeling_gemma4.create_causal_mask = third_party
+
+    unpatch_gemma4_hybrid_mask()
+
+    assert modeling_gemma4.create_causal_mask is third_party
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: tiny Gemma4TextModel (sliding + full_attention layers),
+# end-to-end forward with padded mask, no real weights / CUDA needed.
 # ---------------------------------------------------------------------------
 
 
 def _build_tiny_gemma4_text_model():
-    """Return a tiny randomly-initialized Gemma4TextModel with mixed layers."""
+    """Tiny randomly-initialized Gemma4TextModel with mixed layer types."""
     import torch
     from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
     from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
@@ -227,17 +462,14 @@ def _build_tiny_gemma4_text_model():
         hidden_size_per_layer_input=16,
         vocab_size_per_layer_input=128,
     )
-    # Caller-supplied attn impl simulates the pilot config (fa2 at model
-    # level). The hybrid patch is what makes this survive long context.
-    cfg._attn_implementation = "sdpa"  # start safe; the test toggles fa2 later
+    cfg._attn_implementation = "sdpa"
     torch.manual_seed(42)
     model = Gemma4TextModel(cfg).eval()
     return model, cfg
 
 
 def _apply_hybrid_attn_inline(model, cfg):
-    """Replicate what ``patch_manager._apply_gemma_hybrid_attention`` does
-    to a model, without needing a full PatchManager / pydantic cfg."""
+    """Replicate ``patch_manager._apply_gemma_hybrid_attention`` for tests."""
     import copy
 
     from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
@@ -253,11 +485,7 @@ def _apply_hybrid_attn_inline(model, cfg):
 
 
 def test_tiny_gemma4_long_context_forward_does_not_crash(restore_gemma4_module):
-    """End-to-end invariant: with the hybrid attn patch applied, a tiny
-    Gemma4TextModel runs a forward at long context (1024 tokens) with
-    real padding in the attention mask, producing the expected output
-    shape. This exercises the actual code path that crashed the pilot
-    without needing a real 26B checkpoint or CUDA."""
+    """End-to-end: tiny model + hybrid patch survives padded forward at S=1024."""
     import torch
 
     model, cfg = _build_tiny_gemma4_text_model()
@@ -266,9 +494,8 @@ def test_tiny_gemma4_long_context_forward_does_not_crash(restore_gemma4_module):
     B, S = 2, 1024
     input_ids = torch.randint(0, cfg.vocab_size, (B, S))
     attn_mask = torch.ones(B, S, dtype=torch.long)
-    # Pad positions in the second row. Without padding, SDPA falls back to
-    # ``is_causal=True`` with ``mask=None`` — we need a materialized 4D
-    # mask to exercise the actual bug site.
+    # Padding required: without it SDPA short-circuits to is_causal=True
+    # with mask=None and the materialized-4D-mask path goes unexercised.
     attn_mask[1, S // 2 :] = 0
 
     with torch.no_grad():
@@ -281,11 +508,8 @@ def test_tiny_gemma4_long_context_forward_does_not_crash(restore_gemma4_module):
 def test_patched_create_causal_mask_returns_4d_for_real_config(
     restore_gemma4_module,
 ):
-    """Hit the REAL ``create_causal_mask`` (not a mock) via the wrapper
-    and verify the returned mask is a 4D tensor — which is the shape the
-    SDPA-patched global layers need. Without the patch and with a
-    caller-supplied FA2 config this would return a 2D mask and the layer
-    would crash at long context."""
+    """Real (un-mocked) factory through the wrapper returns a 4D mask
+    even when the caller's config says FA2."""
     import torch
     from transformers.cache_utils import DynamicCache
     from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
@@ -308,15 +532,12 @@ def test_patched_create_causal_mask_returns_4d_for_real_config(
         hidden_size_per_layer_input=16,
         vocab_size_per_layer_input=128,
     )
-    # Simulate the pilot: caller says flash_attention_2, but global layers
-    # were switched to SDPA per-layer. Without the patch, create_causal_mask
-    # would return an FA2 2D mask here and the SDPA layer would crash.
     cfg._attn_implementation = "flash_attention_2"
 
     B, S = 2, 1024
     inputs_embeds = torch.zeros((B, S, cfg.hidden_size), dtype=torch.float32)
     attention_mask = torch.ones((B, S), dtype=torch.long)
-    attention_mask[1, S // 2 :] = 0  # force the 4D materialized path
+    attention_mask[1, S // 2 :] = 0
     position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
     past_key_values = DynamicCache(config=cfg)
 
@@ -331,16 +552,290 @@ def test_patched_create_causal_mask_returns_4d_for_real_config(
     assert mask is not None
     assert isinstance(mask, torch.Tensor)
     assert mask.dim() == 4, (
-        f"expected a 4D SDPA-format mask, got {mask.dim()}D "
-        f"shape={tuple(mask.shape)}. The full_attention global layers need "
-        "this shape or they crash at long context."
+        f"expected 4D SDPA mask, got {mask.dim()}D shape={tuple(mask.shape)}"
     )
     assert mask.shape[0] == B
     assert mask.shape[-1] == S
     assert mask.shape[-2] == S
-
-    # Caller's config must be untouched — other code paths still read it.
     assert cfg._attn_implementation == "flash_attention_2"
+
+
+def test_patched_create_masks_for_generate_returns_4d_full_attention(
+    restore_gemma4_module,
+):
+    """Real (un-mocked) factory through the wrapper: full_attention entry
+    is 4D SDPA, sliding stays 2D FA2. This is the multimodal-CPT failure
+    mode entry point."""
+    import torch
+    from transformers.cache_utils import DynamicCache
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    patch_gemma4_hybrid_mask()
+    modeling_gemma4 = restore_gemma4_module
+
+    if not hasattr(modeling_gemma4, "create_masks_for_generate"):
+        pytest.skip("transformers version lacks create_masks_for_generate")
+
+    cfg = Gemma4TextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=64,
+        max_position_embeddings=2048,
+        hidden_size_per_layer_input=16,
+        vocab_size_per_layer_input=128,
+    )
+    cfg._attn_implementation = "flash_attention_2"
+
+    B, S = 2, 256
+    inputs_embeds = torch.zeros((B, S, cfg.hidden_size), dtype=torch.float32)
+    attention_mask = torch.ones((B, S), dtype=torch.long)
+    attention_mask[1, S // 2 :] = 0
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    past_key_values = DynamicCache(config=cfg)
+
+    result = modeling_gemma4.create_masks_for_generate(
+        config=cfg,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
+
+    assert isinstance(result, dict), (
+        f"expected a dict, got {type(result).__name__}"
+    )
+    assert "full_attention" in result
+    full_attn_mask = result["full_attention"]
+    assert isinstance(full_attn_mask, torch.Tensor)
+    assert full_attn_mask.dim() == 4, (
+        f"full_attention must be 4D, got {full_attn_mask.dim()}D "
+        f"shape={tuple(full_attn_mask.shape)}"
+    )
+
+    if "sliding_attention" in result and result["sliding_attention"] is not None:
+        sliding = result["sliding_attention"]
+        if isinstance(sliding, torch.Tensor):
+            assert sliding.dim() == 2, (
+                f"sliding_attention must stay 2D FA2, got {sliding.dim()}D "
+                f"shape={tuple(sliding.shape)}"
+            )
+
+    assert cfg._attn_implementation == "flash_attention_2"
+
+
+def test_create_causal_mask_mapping_transitive_coverage(restore_gemma4_module):
+    """``create_causal_mask_mapping`` calls module-level ``create_causal_mask``
+    internally, so our rebind propagates transitively — no explicit wrapper
+    needed. If a future transformers version inlines or aliases the call,
+    this test fails and signals we need a direct wrapper."""
+    import torch
+    from transformers.cache_utils import DynamicCache
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    modeling_gemma4 = restore_gemma4_module
+    if not hasattr(modeling_gemma4, "create_causal_mask_mapping"):
+        pytest.skip("transformers version lacks create_causal_mask_mapping")
+
+    patch_gemma4_hybrid_mask()
+
+    cfg = Gemma4TextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=64,
+        max_position_embeddings=2048,
+        hidden_size_per_layer_input=16,
+        vocab_size_per_layer_input=128,
+    )
+    cfg._attn_implementation = "flash_attention_2"
+
+    B, S = 2, 256
+    inputs_embeds = torch.zeros((B, S, cfg.hidden_size), dtype=torch.float32)
+    attention_mask = torch.ones((B, S), dtype=torch.long)
+    attention_mask[1, S // 2 :] = 0
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    past_key_values = DynamicCache(config=cfg)
+
+    result = modeling_gemma4.create_causal_mask_mapping(
+        config=cfg,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
+
+    assert isinstance(result, dict)
+    assert "full_attention" in result
+    full_attn_mask = result["full_attention"]
+    assert isinstance(full_attn_mask, torch.Tensor)
+    assert full_attn_mask.dim() == 4, (
+        f"expected 4D mask, got {full_attn_mask.dim()}D "
+        f"shape={tuple(full_attn_mask.shape)}"
+    )
+
+
+def test_tiny_gemma4_consumes_dict_mask_from_create_masks_for_generate(
+    restore_gemma4_module,
+):
+    """End-to-end multimodal contract: wrapper builds dict → text model
+    short-circuits its own mask construction and consumes the dict directly.
+
+    Uses ``Gemma4TextModel`` (not full ``Gemma4Model``) because the
+    multimodal wrapper requires irrelevant audio/vision configs; the
+    dict-passthrough invariant is what distinguishes patched/unpatched.
+    All-SDPA at model level so this runs on CPU; the FA2-at-model-level
+    shape correctness is covered by the unit-level test above."""
+    import torch
+
+    modeling_gemma4 = restore_gemma4_module
+    if not hasattr(modeling_gemma4, "create_masks_for_generate"):
+        pytest.skip("transformers version lacks create_masks_for_generate")
+
+    model, cfg = _build_tiny_gemma4_text_model()
+    _apply_hybrid_attn_inline(model, cfg)
+
+    B, S = 2, 1024
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S))
+    attn_mask_2d = torch.ones(B, S, dtype=torch.long)
+    attn_mask_2d[1, S // 2 :] = 0
+
+    inputs_embeds = model.embed_tokens(input_ids).detach()
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    causal_mask_mapping = modeling_gemma4.create_masks_for_generate(
+        cfg,
+        inputs_embeds,
+        attn_mask_2d,
+        None,
+        position_ids,
+    )
+    assert isinstance(causal_mask_mapping, dict)
+    assert "full_attention" in causal_mask_mapping
+    assert causal_mask_mapping["full_attention"].dim() == 4
+
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            attention_mask=causal_mask_mapping,
+            position_ids=position_ids,
+        )
+
+    assert out.last_hidden_state.shape == (B, S, cfg.hidden_size)
+    assert torch.isfinite(out.last_hidden_state).all()
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: tiny multimodal Gemma4Model (vision/audio towers None).
+# ---------------------------------------------------------------------------
+
+
+def _build_tiny_gemma4_multimodal_model():
+    """Tiny multimodal ``Gemma4Model`` with vision/audio towers disabled
+    (a valid Gemma4Config). Exercises the real ``Gemma4Model.forward``."""
+    import torch
+    from transformers.models.gemma4.configuration_gemma4 import (
+        Gemma4Config,
+        Gemma4TextConfig,
+    )
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4Model
+
+    text_cfg = Gemma4TextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=64,
+        max_position_embeddings=2048,
+        hidden_size_per_layer_input=16,
+        vocab_size_per_layer_input=128,
+    )
+    text_cfg._attn_implementation = "sdpa"
+    cfg = Gemma4Config(
+        text_config=text_cfg,
+        vision_config=None,
+        audio_config=None,
+    )
+    cfg._attn_implementation = "sdpa"
+    torch.manual_seed(43)
+    model = Gemma4Model(cfg).eval()
+    return model, cfg
+
+
+def _apply_hybrid_attn_inline_multimodal(model, cfg):
+    """Mirror ``patch_manager._apply_gemma_hybrid_attention`` for the
+    multimodal model — decoder layers live under ``language_model``."""
+    import copy
+
+    from axolotl.monkeypatch.gemma4_hybrid_mask import patch_gemma4_hybrid_mask
+
+    layer_types = cfg.text_config.layer_types
+    for layer_idx, layer in enumerate(model.language_model.layers):
+        if layer_types[layer_idx] != "sliding_attention":
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None and hasattr(attn, "config"):
+                sdpa_cfg = copy.copy(attn.config)
+                sdpa_cfg._attn_implementation = "sdpa"
+                attn.config = sdpa_cfg
+    patch_gemma4_hybrid_mask()
+
+
+def test_tiny_gemma4_multimodal_forward_with_padding(restore_gemma4_module):
+    """End-to-end multimodal-CPT bug fix: real Gemma4Model, hybrid attn,
+    mbs=2 padded forward survives. Runs in SDPA on CPU; the FA2-at-model-
+    level shape correctness is covered by the unit test above."""
+    import torch
+
+    model, cfg = _build_tiny_gemma4_multimodal_model()
+    _apply_hybrid_attn_inline_multimodal(model, cfg)
+
+    B, S = 2, 1024
+    input_ids = torch.randint(0, cfg.text_config.vocab_size, (B, S))
+    attn_mask = torch.ones(B, S, dtype=torch.long)
+    attn_mask[1, S // 2 :] = 0
+
+    with torch.no_grad():
+        out = model(input_ids=input_ids, attention_mask=attn_mask)
+
+    assert out.last_hidden_state.shape == (B, S, cfg.text_config.hidden_size)
+    assert torch.isfinite(out.last_hidden_state).all()
+
+
+def test_tiny_gemma4_multimodal_forward_unpatched_baseline_works(
+    restore_gemma4_module,
+):
+    """Baseline sanity: all-SDPA multimodal forward must run unpatched too,
+    proving the surrounding tests don't get false signal from a broken
+    test rig."""
+    import torch
+
+    model, cfg = _build_tiny_gemma4_multimodal_model()
+
+    B, S = 2, 256
+    input_ids = torch.randint(0, cfg.text_config.vocab_size, (B, S))
+    attn_mask = torch.ones(B, S, dtype=torch.long)
+    attn_mask[1, S // 2 :] = 0
+
+    with torch.no_grad():
+        out = model(input_ids=input_ids, attention_mask=attn_mask)
+
+    assert out.last_hidden_state.shape == (B, S, cfg.text_config.hidden_size)
+    assert torch.isfinite(out.last_hidden_state).all()
 
 
 @pytest.fixture

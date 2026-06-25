@@ -98,13 +98,22 @@ class MultiModalPretrainDataCollator(DataCollatorMixin):
         texts: list[str] = []
         images: list[list[Image.Image]] = []
         for i, ex in enumerate(examples):
-            if "_mm_text" not in ex or "images" not in ex:
+            # Accept either the encoder's `_mm_text` (streaming / prepared path)
+            # or the raw `text` column (non-streaming `datasets:` path with
+            # skip_prepare_dataset: true, where rows pass through unencoded). The
+            # two are identical — encode_multimodal_pretrain sets `_mm_text = text`
+            # verbatim — and the processor re-tokenizes below regardless, so the
+            # raw text is sufficient. `images` is still required.
+            mm_text = ex.get("_mm_text")
+            if mm_text is None:
+                mm_text = ex.get("text")
+            if mm_text is None or "images" not in ex:
                 raise KeyError(
                     f"MultiModalPretrainDataCollator: row {i} is missing "
-                    f"'_mm_text' or 'images'. Did you wire the multimodal CPT "
-                    f"encoder (encode_streaming_multimodal)?"
+                    f"'_mm_text'/'text' or 'images'. Did you wire the multimodal "
+                    f"CPT encoder (encode_streaming_multimodal), or provide raw "
+                    f"`text` + `images` rows?"
                 )
-            mm_text = ex["_mm_text"]
             if not isinstance(mm_text, str):
                 raise TypeError(
                     f"Row {i}: `_mm_text` must be str, got "

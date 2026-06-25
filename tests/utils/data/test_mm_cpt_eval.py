@@ -2,11 +2,99 @@
 
 from __future__ import annotations
 
+from datasets import Dataset
+
 from axolotl.utils.data.sft import (
     _create_placeholder_dataset,
+    _load_and_process_single_dataset,
+    _prepare_standard_dataset,
     _prepare_streaming_dataset,
 )
 from axolotl.utils.dict import DictDefault
+
+
+class _Tokenizer:
+    name_or_path = "tok"
+
+
+def test_nonstreaming_pretokenized_mm_rows_keep_collator_columns(monkeypatch):
+    dataset = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]],
+            "attention_mask": [[1, 1, 1]],
+            "labels": [[1, 2, 3]],
+            "_mm_text": ["<image>\nrow"],
+            "images": [["rel/a.png"]],
+        }
+    )
+    monkeypatch.setattr(
+        "axolotl.utils.data.sft.load_dataset_with_config",
+        lambda *_args, **_kwargs: dataset,
+    )
+    cfg = DictDefault(
+        {
+            "hf_use_auth_token": None,
+            "dataset_num_proc": None,
+            "dataset_keep_in_memory": False,
+            "skip_prepare_dataset": False,
+        }
+    )
+    entry = DictDefault(
+        {"path": "json", "type": "multimodal_pretrain", "split": "train"}
+    )
+
+    wrapped, _ = _load_and_process_single_dataset(
+        entry,
+        cfg,
+        _Tokenizer(),
+        split="train",
+        seed=42,
+    )
+
+    assert wrapped.column_names == dataset.column_names
+    assert wrapped[0]["_mm_text"] == "<image>\nrow"
+    assert wrapped[0]["images"] == ["rel/a.png"]
+
+
+def test_standard_mm_datasets_num_epochs_derives_total_steps(monkeypatch, tmp_path):
+    train_dataset = Dataset.from_dict(
+        {
+            "input_ids": [[1], [1, 2], [1, 2, 3], [1], [1, 2]],
+            "attention_mask": [[1], [1, 1], [1, 1, 1], [1], [1, 1]],
+            "labels": [[1], [1, 2], [1, 2, 3], [1], [1, 2]],
+        }
+    )
+
+    def fake_load_and_prepare(*_args, **_kwargs):
+        return train_dataset, None, [None]
+
+    monkeypatch.setattr(
+        "axolotl.utils.data.sft._load_and_prepare_datasets",
+        fake_load_and_prepare,
+    )
+    cfg = DictDefault(
+        {
+            "dataset_prepared_path": str(tmp_path),
+            "datasets": [{"path": "json", "type": "multimodal_pretrain"}],
+            "test_datasets": None,
+            "val_set_size": 0,
+            "sample_packing": False,
+            "eval_sample_packing": False,
+            "max_steps": None,
+            "num_epochs": 2,
+            "batch_size": 4,
+            "skip_prepare_dataset": False,
+            "reward_model": False,
+            "total_num_tokens": None,
+            "total_supervised_tokens": None,
+            "model_config_type": None,
+        }
+    )
+
+    _, _, total_steps, _ = _prepare_standard_dataset(cfg, _Tokenizer(), None)
+
+    assert total_steps == 3
+
 
 # ---- placeholder dataset for dispatch_batches ----------------------------
 
@@ -94,9 +182,6 @@ def test_load_streaming_dataset_routes_ds_type_to_loader(monkeypatch):
                 return self
 
         return _Stub()
-
-    def fake_wrap(ds, *_a, **_kw):
-        return ds
 
     class _StubFormat:
         def with_format(self, *_a, **_kw):

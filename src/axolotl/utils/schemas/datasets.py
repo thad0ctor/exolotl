@@ -272,6 +272,23 @@ class PretrainingDataset(BaseModel):
     )
 
 
+class MultiModalPretrainDataset(PretrainingDataset):
+    type: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_mm_markers(cls, data):
+        if isinstance(data, BaseModel):
+            data = data.model_dump()
+        if not isinstance(data, dict):
+            return data
+        if data.get("type") != "multimodal_pretrain":
+            raise ValueError(
+                "MultiModalPretrainDataset requires type='multimodal_pretrain' "
+            )
+        return data
+
+
 class MultiModalEvalDataset(PretrainingDataset):
     """Multimodal CPT eval dataset configuration (test_datasets entry).
 
@@ -294,6 +311,9 @@ class MultiModalEvalDataset(PretrainingDataset):
                 "MultiModalEvalDataset requires type='multimodal_pretrain' "
                 "or multimodal=True"
             )
+        if data.get("type") != "multimodal_pretrain":
+            data = dict(data)
+            data["type"] = "multimodal_pretrain"
         return data
 
 
@@ -391,5 +411,10 @@ class SyntheticDataset(BaseModel):
 
 
 DatasetConfig = (
-    SFTDataset | DPODataset | KTODataset | StepwiseSupervisedDataset | SyntheticDataset
+    MultiModalPretrainDataset
+    | SFTDataset
+    | DPODataset
+    | KTODataset
+    | StepwiseSupervisedDataset
+    | SyntheticDataset
 )

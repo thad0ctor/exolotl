@@ -635,6 +635,7 @@ class TrainerBuilderBase(abc.ABC):
             "dion_rank_fraction",
             "dion_rank_multiple_of",
             "dataset_num_proc",
+            "ignore_data_skip",
             # memory management
             "torch_empty_cache_steps",
         ]:

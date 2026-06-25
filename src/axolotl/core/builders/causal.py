@@ -69,18 +69,36 @@ def _warn_if_num_workers_zero_for_mm(cfg, log) -> None:
 
 
 def _is_multimodal_cpt(cfg) -> bool:
-    if not getattr(cfg, "pretraining_dataset", None):
+    return _get_mm_cpt_config(cfg) is not None
+
+
+def _entry_is_multimodal_cpt(entry) -> bool:
+    if entry is None:
         return False
-    ds_first = cfg.pretraining_dataset[0]
     ds_type = None
     mm_flag = None
-    if hasattr(ds_first, "type"):
-        ds_type = getattr(ds_first, "type", None)
-        mm_flag = getattr(ds_first, "multimodal", None)
-    elif isinstance(ds_first, dict):
-        ds_type = ds_first.get("type")
-        mm_flag = ds_first.get("multimodal")
+    if hasattr(entry, "type"):
+        ds_type = getattr(entry, "type", None)
+        mm_flag = getattr(entry, "multimodal", None)
+    elif isinstance(entry, dict):
+        ds_type = entry.get("type")
+        mm_flag = entry.get("multimodal")
     return (ds_type == "multimodal_pretrain") or bool(mm_flag)
+
+
+def _get_mm_cpt_config(cfg, is_eval: bool = False):
+    if is_eval and getattr(cfg, "test_datasets", None):
+        for entry in cfg.test_datasets:
+            if _entry_is_multimodal_cpt(entry):
+                return entry
+    for collection_name in ("pretraining_dataset", "datasets"):
+        collection = getattr(cfg, collection_name, None)
+        if not collection:
+            continue
+        for entry in collection:
+            if _entry_is_multimodal_cpt(entry):
+                return entry
+    return None
 
 
 def _mm_cpt_get(pt_cfg, key, default=None):
@@ -491,12 +509,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             build_image_token_spec,
         )
 
-        if is_eval and self.cfg.test_datasets:
-            pt_cfg = self.cfg.test_datasets[0]
-        elif self.cfg.pretraining_dataset:
-            pt_cfg = self.cfg.pretraining_dataset[0]
-        else:
-            pt_cfg = {}
+        pt_cfg = _get_mm_cpt_config(self.cfg, is_eval=is_eval) or {}
         spec = build_image_token_spec(
             self.processor, override=_mm_cpt_get(pt_cfg, "image_token")
         )

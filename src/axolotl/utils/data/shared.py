@@ -117,6 +117,23 @@ def load_dataset_with_config(
     if Path(dataset_config.path).exists():
         return _load_from_local_path(dataset_config, load_dataset_kwargs)
 
+    # `path` is a HF packaged-builder name (json/parquet/csv/arrow/text) plus
+    # explicit `data_files`: load via the builder so LOCAL data_files are read
+    # from disk. Without this, the non-streaming path falls through to
+    # `_load_from_data_files`, which treats `path` as a Hub repo_id and tries to
+    # `hf_hub_download` the data_files — a 401 for a local absolute path. This
+    # mirrors the streaming / `pretraining_dataset` loader, which already accepts
+    # the `path: json` + `data_files: <local file>` shape. A builder name is
+    # never a Hub repo, so this can't shadow the `path: <org/repo>` +
+    # `data_files: <file-in-repo>` case (that path is not a builder name).
+    builder_names = set(EXTENSIONS_TO_DATASET_TYPES.values()) | {"json"}
+    if dataset_config.data_files and dataset_config.path in builder_names:
+        return load_dataset(
+            dataset_config.path,
+            data_files=dataset_config.data_files,
+            **load_dataset_kwargs,
+        )
+
     # Check if it's a HuggingFace dataset
     is_hub_dataset = _check_if_hub_dataset(dataset_config, use_auth_token)
 
@@ -505,8 +522,81 @@ def try_load_from_hub(
         return None
 
 
+def _dataset_hash_get(dataset_config, key: str, default=None):
+    if hasattr(dataset_config, "get"):
+        try:
+            return dataset_config.get(key, default)
+        except (AttributeError, KeyError, TypeError):
+            pass
+    return getattr(dataset_config, key, default)
+
+
+def _dataset_hash_component(dataset_config) -> str:
+    component = (
+        f"{_dataset_hash_get(dataset_config, 'path')}:"
+        f"{_dataset_hash_get(dataset_config, 'type')}:"
+        f"{_dataset_hash_get(dataset_config, 'shards')}:"
+        f"{_dataset_hash_get(dataset_config, 'conversation')}:"
+        f"{_dataset_hash_get(dataset_config, 'split')}:"
+        f"{_dataset_hash_get(dataset_config, 'temperature') or 1.0}"
+    )
+    if _dataset_hash_get(dataset_config, "type") == "multimodal_pretrain" or bool(
+        _dataset_hash_get(dataset_config, "multimodal")
+    ):
+        component += (
+            f":{_dataset_hash_get(dataset_config, 'text_column')}:"
+            f"{_dataset_hash_get(dataset_config, 'image_column')}:"
+            f"{_dataset_hash_get(dataset_config, 'image_base_dir')}:"
+            f"{_dataset_hash_get(dataset_config, 'image_token')}:"
+            f"{_dataset_hash_get(dataset_config, 'data_files')}:"
+            f"{_dataset_hash_get(dataset_config, 'ds_type')}"
+        )
+    return component
+
+
+def generate_pretraining_dataset_hash(
+    cfg: DictDefault,
+    pretraining_config: DictDefault,
+    tokenizer_name: str,
+    processor_name: str | None,
+) -> str:
+    """Hash that pins the prepared mm-pretraining cache to the inputs that produced it."""
+    if cfg.get("added_tokens_overrides"):
+        tokenizer_fingerprint = f"{cfg.tokenizer_config}+overrides:" + ",".join(
+            f"{k}={v}" for k, v in sorted(cfg.added_tokens_overrides.items())
+        )
+    else:
+        tokenizer_fingerprint = tokenizer_name
+
+    # image_base_dir is consumed by the collator at runtime, not by the encoder, so it does not bind cached arrows.
+    keys = (
+        "path",
+        "name",
+        "split",
+        "data_files",
+        "ds_type",
+        "type",
+        "text_column",
+        "image_column",
+        "image_token",
+        "multimodal",
+        "skip",
+    )
+    ds_fingerprint = "|".join(f"{k}={pretraining_config.get(k)!r}" for k in keys)
+    config_str = (
+        f"pretrain@{cfg.sequence_len}|"
+        f"{ds_fingerprint}|"
+        f"{tokenizer_fingerprint}|"
+        f"processor={processor_name or 'None'}"
+    )
+    return str(md5(config_str))
+
+
 def generate_dataset_hash_from_config(
-    cfg: DictDefault, cfg_datasets: list, tokenizer_name: str
+    cfg: DictDefault,
+    cfg_datasets: list,
+    tokenizer_name: str,
+    processor_name: str | None = None,
 ) -> str:
     """Generate a hash to uniquely identify a dataset configuration for SFT.
 
@@ -527,12 +617,19 @@ def generate_dataset_hash_from_config(
     else:
         tokenizer_fingerprint = tokenizer_name
 
+    has_mm = any(
+        _dataset_hash_get(d, "type") == "multimodal_pretrain"
+        or bool(_dataset_hash_get(d, "multimodal"))
+        for d in cfg_datasets
+    )
+    processor_fingerprint = f"|processor={processor_name}" if has_mm else ""
+
     config_str = (
         f"{cfg.sequence_len}@{cfg.sample_packing}@{cfg.eval_sample_packing}@"
         f"{cfg.group_by_length}@{cfg.kd_temperature or 1.0}@"
         f"{cfg.dataset_exact_deduplication or False}|"
-        f"{'|'.join(sorted([f'{d.path}:{d.type}:{d.shards}:{d.conversation}:{d.split}:{d.temperature or 1.0}' for d in cfg_datasets]))}"
-        f"|{tokenizer_fingerprint}"
+        f"{'|'.join(_dataset_hash_component(d) for d in cfg_datasets)}"
+        f"|{tokenizer_fingerprint}{processor_fingerprint}"
     )
     return str(md5(config_str))
 

@@ -37,6 +37,8 @@ class DatasetValidationMixin:
     @field_validator("datasets", mode="before")
     @classmethod
     def deprecate_sharegpt_datasets(cls, datasets):
+        if datasets is None:
+            return datasets
         for _, ds_cfg in enumerate(datasets):
             ds_type = (
                 ds_cfg.get("type")
@@ -1402,11 +1404,36 @@ class PretrainingValidationMixin:
                 mm_flag_ = getattr(entry, "multimodal", None)
             return ds_type_ == "multimodal_pretrain" or bool(mm_flag_)
 
+        def _entry_has_mm_flag_without_dataset_type(entry) -> bool:
+            if isinstance(entry, dict):
+                ds_type_ = entry.get("type")
+                mm_flag_ = entry.get("multimodal")
+            else:
+                ds_type_ = getattr(entry, "type", None)
+                mm_flag_ = getattr(entry, "multimodal", None)
+            return bool(mm_flag_) and ds_type_ != "multimodal_pretrain"
+
+        def _datasets_entry_is_mm(entry) -> bool:
+            if isinstance(entry, dict):
+                return entry.get("type") == "multimodal_pretrain"
+            return getattr(entry, "type", None) == "multimodal_pretrain"
+
         pd = data.get("pretraining_dataset")
         pd_list = pd if isinstance(pd, list) else ([pd] if pd else [])
-        train_is_mm = (
-            bool(pd_list) and isinstance(pd_list[0], dict) and _entry_is_mm(pd_list[0])
-        )
+        datasets = data.get("datasets") or []
+        datasets_list = datasets if isinstance(datasets, list) else [datasets]
+
+        pd_is_mm = any(_entry_is_mm(entry) for entry in pd_list)
+        if any(
+            _entry_has_mm_flag_without_dataset_type(entry) for entry in datasets_list
+        ):
+            raise ValueError(
+                "Multimodal CPT under `datasets` requires "
+                "`type: multimodal_pretrain`. The `multimodal: true` shortcut "
+                "is only supported for `pretraining_dataset` and `test_datasets`."
+            )
+        datasets_is_mm = any(_datasets_entry_is_mm(entry) for entry in datasets_list)
+        train_is_mm = pd_is_mm or datasets_is_mm
 
         test_datasets = data.get("test_datasets") or []
         test_dicts = [t for t in test_datasets if isinstance(t, dict)]
@@ -1421,7 +1448,8 @@ class PretrainingValidationMixin:
             if all(mm_flags) and not train_is_mm:
                 raise ValueError(
                     "Multimodal `test_datasets` require multimodal CPT "
-                    "training (set `pretraining_dataset[0].type` to "
+                    "training (set `pretraining_dataset[0].type` or "
+                    "`datasets[0].type` to "
                     "'multimodal_pretrain' or `multimodal: true`)."
                 )
             if not any(mm_flags) and train_is_mm:
@@ -1431,11 +1459,11 @@ class PretrainingValidationMixin:
                     "or multimodal: true)."
                 )
 
-        if not pd_list:
+        if not train_is_mm:
             return data
 
         # MM config resolves from entry[0] only; multi-entry runs miscollate or silently demote.
-        if len(pd_list) > 1 and any(_entry_is_mm(e) for e in pd_list):
+        if pd_is_mm and len(pd_list) > 1:
             raise ValueError(
                 "Multimodal CPT supports exactly one `pretraining_dataset` "
                 f"entry (found {len(pd_list)}). Image settings "
@@ -1444,13 +1472,28 @@ class PretrainingValidationMixin:
                 "would be silently miscollated or drop their MM config. "
                 "Split multimodal CPT into its own run."
             )
-
-        first = pd_list[0]
-        if not isinstance(first, dict):
-            return data
-
-        if not train_is_mm:
-            return data
+        if datasets_is_mm and len(datasets_list) > 1:
+            raise ValueError(
+                "Multimodal CPT supports exactly one `datasets` entry "
+                f"when using the non-streaming prepared path (found "
+                f"{len(datasets_list)}). Image settings (`image_base_dir`, "
+                "`image_token`) and MM-mode detection resolve once for the "
+                "collator, so mixed or multiple training entries are not "
+                "supported. Split multimodal CPT into its own run."
+            )
+        if pd_is_mm and datasets_is_mm:
+            raise ValueError(
+                "Multimodal CPT cannot be configured under both "
+                "`pretraining_dataset` and `datasets`. Use "
+                "`pretraining_dataset` for streaming or `datasets` for the "
+                "non-streaming prepared path."
+            )
+        if datasets_is_mm and data.get("streaming"):
+            raise ValueError(
+                "Multimodal CPT under `datasets` is the non-streaming prepared "
+                "path. For streaming, configure the entry under "
+                "`pretraining_dataset` with `streaming: true`."
+            )
 
         if not data.get("processor_type"):
             raise ValueError(
@@ -1473,6 +1516,17 @@ class PretrainingValidationMixin:
                 "with `chat_template`. The point of the CPT path is to avoid "
                 "conversational scaffolding entirely. Remove `chat_template` "
                 "or switch to chat-template SFT."
+            )
+        if (
+            datasets_is_mm
+            and (data.get("excess_length_strategy") or "drop").lower() == "truncate"
+        ):
+            raise ValueError(
+                "Multimodal CPT under `datasets` cannot use "
+                "`excess_length_strategy: truncate`. The collator re-tokenizes "
+                "`_mm_text` with the processor at batch time, so truncating only "
+                "the prepared `input_ids` would not truncate the actual model "
+                "inputs. Use `drop` or `raise` instead."
             )
         # Keep `images` and `_mm_text` columns alive for the collator.
         prev_remove_unused = data.get("remove_unused_columns")
