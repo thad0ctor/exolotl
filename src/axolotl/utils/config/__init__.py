@@ -26,6 +26,7 @@ from axolotl.utils.schemas.config import (
 from axolotl.utils.schemas.datasets import (
     DPODataset,
     KTODataset,
+    MultiModalPretrainDataset,
     SFTDataset,
     SyntheticDataset,
 )
@@ -354,6 +355,28 @@ def validate_config(
             ) == "_synthetic" and not isinstance(ds_cfg, SyntheticDataset):
                 cfg["datasets"][idx] = SyntheticDataset(
                     **(ds_cfg if isinstance(ds_cfg, dict) else dict(ds_cfg))
+                )
+            elif (
+                (
+                    ds_cfg.get("type")
+                    if isinstance(ds_cfg, dict)
+                    else getattr(ds_cfg, "type", None)
+                )
+                == "multimodal_pretrain"
+            ) and not isinstance(ds_cfg, MultiModalPretrainDataset):
+                cfg["datasets"][idx] = MultiModalPretrainDataset(
+                    **(ds_cfg if isinstance(ds_cfg, dict) else dict(ds_cfg))
+                )
+            elif bool(
+                ds_cfg.get("multimodal")
+                if isinstance(ds_cfg, dict)
+                else getattr(ds_cfg, "multimodal", None)
+            ):
+                raise ValueError(
+                    "Multimodal CPT under `datasets` requires "
+                    "`type: multimodal_pretrain`. The `multimodal: true` "
+                    "shortcut is only supported for `pretraining_dataset` "
+                    "and `test_datasets`."
                 )
             elif not isinstance(ds_cfg, SFTDataset):
                 cfg["datasets"][idx] = SFTDataset(**dict(ds_cfg))

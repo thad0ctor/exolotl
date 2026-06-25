@@ -1848,6 +1848,35 @@ class TestDataloaderValidation(BaseValidation):
         assert new_cfg.dataloader_prefetch_factor == 256
 
 
+class TestIgnoreDataSkip(BaseValidation):
+    """
+    Tests for the cfg.ignore_data_skip field that forwards to TrainingArguments.
+    """
+
+    def test_default_is_none(self, minimal_cfg):
+        new_cfg = validate_config(minimal_cfg)
+        assert new_cfg.ignore_data_skip is None
+
+    def test_true_survives_validation(self, minimal_cfg):
+        cfg = DictDefault({**minimal_cfg, "ignore_data_skip": True})
+        new_cfg = validate_config(cfg)
+        assert new_cfg.ignore_data_skip is True
+
+    def test_false_survives_validation(self, minimal_cfg):
+        cfg = DictDefault({**minimal_cfg, "ignore_data_skip": False})
+        new_cfg = validate_config(cfg)
+        assert new_cfg.ignore_data_skip is False
+
+    def test_listed_in_base_training_args_passthrough(self):
+        # Sentinel: if this list ever loses ignore_data_skip the cfg field becomes a no-op.
+        import inspect
+
+        from axolotl.core.builders.base import TrainerBuilderBase
+
+        src = inspect.getsource(TrainerBuilderBase._set_base_training_args)
+        assert '"ignore_data_skip"' in src
+
+
 class TestGCStepsMigration(BaseValidation):
     """
     Tests for gc_steps -> torch_empty_cache_steps / gc_collect_steps migration

@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
-from transformers import AutoProcessor
+from transformers import AutoProcessor, TrainerControl, TrainerState, TrainingArguments
 
+from axolotl.core.builders.causal import (
+    HFCausalTrainerBuilder,
+    _get_mm_cpt_config,
+    _is_multimodal_cpt,
+)
+from axolotl.core.trainers.constants import TOKENS_STATE_FILE
 from axolotl.prompt_strategies.multimodal_pretrain import build_image_token_spec
+from axolotl.utils.callbacks.tokens_per_second import TokensPerSecondCallback
 from axolotl.utils.collators.mm_pretrain import MultiModalPretrainDataCollator
 from axolotl.utils.data.streaming import (
     encode_streaming_multimodal,
@@ -221,6 +229,15 @@ def test_build_image_token_spec_no_candidates_raises():
 # ---- wrap_streaming_dataset routing --------------------------------------
 
 
+def _patch_streaming_partial(monkeypatch, fake_partial):
+    import axolotl.utils.data.streaming as streaming_mod
+
+    if hasattr(streaming_mod, "partial"):
+        monkeypatch.setattr(streaming_mod, "partial", fake_partial)
+    else:
+        monkeypatch.setattr(streaming_mod.functools, "partial", fake_partial)
+
+
 def test_wrap_streaming_dataset_uses_pretraining_config_arg(
     smolvlm_processor, monkeypatch
 ):
@@ -233,7 +250,7 @@ def test_wrap_streaming_dataset_uses_pretraining_config_arg(
         captured["kwargs"] = kwargs
         return lambda batch: batch
 
-    monkeypatch.setattr("axolotl.utils.data.streaming.functools.partial", fake_partial)
+    _patch_streaming_partial(monkeypatch, fake_partial)
 
     class _Dataset:
         features = {"text": None, "images": None}
@@ -295,7 +312,7 @@ def test_wrap_streaming_dataset_eval_honors_eval_sequence_len(
         captured["kwargs"] = kwargs
         return lambda batch: batch
 
-    monkeypatch.setattr("axolotl.utils.data.streaming.functools.partial", fake_partial)
+    _patch_streaming_partial(monkeypatch, fake_partial)
 
     class _Dataset:
         features = {"text": None, "images": None}
@@ -375,6 +392,53 @@ def test_wrap_streaming_dataset_eval_honors_eval_sequence_len(
     assert captured["kwargs"]["max_tokens"] == 4096
 
 
+def test_mm_cpt_detection_includes_nonstreaming_datasets():
+    cfg = DictDefault(
+        {
+            "pretraining_dataset": None,
+            "datasets": [
+                {
+                    "path": "train/ds",
+                    "type": "multimodal_pretrain",
+                    "image_base_dir": "/train/images",
+                }
+            ],
+        }
+    )
+
+    assert _is_multimodal_cpt(cfg)
+    assert _get_mm_cpt_config(cfg)["image_base_dir"] == "/train/images"
+
+
+def test_mm_cpt_collator_uses_nonstreaming_dataset_config():
+    tok = _StubTokenizer({"<image>": 42})
+    processor = _StubProcessor(tok, image_token="<image>")
+    builder = object.__new__(HFCausalTrainerBuilder)
+    builder.tokenizer = tok
+    builder.processor = processor
+    builder.cfg = DictDefault(
+        {
+            "pretraining_dataset": None,
+            "datasets": [
+                {
+                    "path": "train/ds",
+                    "type": "multimodal_pretrain",
+                    "image_base_dir": "/train/images",
+                    "image_token": "<image>",
+                }
+            ],
+            "test_datasets": None,
+            "sequence_len": 128,
+            "eval_sequence_len": None,
+        }
+    )
+
+    collator = HFCausalTrainerBuilder._build_mm_pretrain_collator(builder)
+
+    assert isinstance(collator, MultiModalPretrainDataCollator)
+    assert collator.image_base_dir == "/train/images"
+
+
 # ---- MultiModalPretrainDataCollator ---------------------------------------
 
 
@@ -430,6 +494,47 @@ def test_collator_raises_on_missing_columns(smolvlm_processor):
     )
     with pytest.raises(KeyError, match="encode_streaming_multimodal"):
         collator.torch_call([{"input_ids": [1, 2, 3]}])  # no _mm_text / images
+
+
+def test_collator_resolves_relative_image_base_dir(smolvlm_processor, tmp_path):
+    spec = build_image_token_spec(smolvlm_processor)
+    collator = MultiModalPretrainDataCollator(
+        tokenizer=smolvlm_processor.tokenizer,
+        processor=smolvlm_processor,
+        image_token_spec=spec,
+        image_base_dir=str(tmp_path),
+    )
+
+    assert collator._resolve_image_source("rel/img.png") == str(
+        tmp_path / "rel/img.png"
+    )
+    assert collator._resolve_image_source("/abs/img.png") == "/abs/img.png"
+    assert (
+        collator._resolve_image_source("https://host/img.png") == "https://host/img.png"
+    )
+
+
+def test_tokens_per_second_callback_restores_checkpoint_token_state(tmp_path):
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / TOKENS_STATE_FILE).write_text(
+        json.dumps({"total": 123, "trainable": 45})
+    )
+    callback = TokensPerSecondCallback(
+        tensor_parallel_size=None,
+        context_parallel_size=None,
+        resume_from_checkpoint=str(checkpoint),
+    )
+    state = TrainerState()
+
+    callback.on_train_begin(
+        TrainingArguments(output_dir=str(tmp_path / "out")),
+        state,
+        TrainerControl(),
+    )
+
+    assert int(state.tokens["total"].item()) == 123
+    assert int(state.tokens["trainable"].item()) == 45
 
 
 # ---- input validation -----------------------------------------------------

@@ -21,6 +21,7 @@ from axolotl.utils.data.shared import (
     create_train_validation_split,
     datasets_with_name_generator,
     generate_dataset_hash_from_config,
+    generate_pretraining_dataset_hash,
     load_dataset_with_config,
     load_preprocessed_dataset,
     merge_datasets,
@@ -197,8 +198,16 @@ def _prepare_streaming_dataset(
                 streaming=False,
             )
 
-    # For streaming, we return max_steps directly from config or -1 if not set
-    total_num_steps = cfg.max_steps if cfg.max_steps else -1
+    # Map-style train_dataset (mm-CPT cache hit) needs real total_num_steps for warmup/scheduler.
+    if isinstance(train_dataset, Dataset):
+        if cfg.max_steps:
+            total_num_steps = min(
+                calculate_total_num_steps(cfg, train_dataset), cfg.max_steps
+            )
+        else:
+            total_num_steps = calculate_total_num_steps(cfg, train_dataset)
+    else:
+        total_num_steps = cfg.max_steps if cfg.max_steps else -1
     return train_dataset, eval_dataset, total_num_steps, []
 
 
@@ -248,14 +257,129 @@ def _extract_pretraining_config(cfg: DictDefault) -> DictDefault:
     )
 
 
+def _is_multimodal_pretrain_config(pretraining_config: DictDefault) -> bool:
+    return pretraining_config.get("type") == "multimodal_pretrain" or bool(
+        pretraining_config.get("multimodal")
+    )
+
+
+def _mm_pretrain_cache_enabled(
+    cfg: DictDefault, pretraining_config: DictDefault, is_eval: bool
+) -> bool:
+    if is_eval:
+        return False
+    if not cfg.dataset_prepared_path or cfg.skip_prepare_dataset:
+        return False
+    if cfg.accelerator_config and cfg.accelerator_config.dispatch_batches:
+        return False
+    return _is_multimodal_pretrain_config(pretraining_config)
+
+
+def _build_mm_pretrain_cache(
+    pretraining_config: DictDefault,
+    cfg: DictDefault,
+    tokenizer: PreTrainedTokenizer,
+    processor: ProcessorMixin | None,
+    dataset_hash: str,
+) -> Dataset:
+    ds_type = pretraining_config.get("ds_type")
+    if ds_type:
+        raw_dataset = load_dataset(
+            ds_type,
+            split=pretraining_config["split"],
+            name=pretraining_config["name"],
+            data_files=(pretraining_config["data_files"] or pretraining_config["path"]),
+            trust_remote_code=pretraining_config.get("trust_remote_code", False),
+        )
+    else:
+        raw_dataset = load_dataset(
+            pretraining_config["path"],
+            split=pretraining_config["split"],
+            name=pretraining_config["name"],
+            data_files=pretraining_config["data_files"],
+            trust_remote_code=pretraining_config.get("trust_remote_code", False),
+        )
+    if pretraining_config["skip"]:
+        LOG.info(f"Skipping {pretraining_config['skip']} samples from the dataset")
+        raw_dataset = raw_dataset.select(
+            range(pretraining_config["skip"], len(raw_dataset))
+        )
+    processed = wrap_streaming_dataset(
+        raw_dataset,
+        tokenizer,
+        cfg,
+        ds_wrapper_fn=None,
+        processor=processor,
+        pretraining_config=pretraining_config,
+        is_eval=False,
+        cache_prep=True,
+    )
+    save_preprocessed_dataset(cfg, processed, dataset_hash, split="train")
+    return processed
+
+
+def _processor_fingerprint(processor: ProcessorMixin | None) -> str | None:
+    if processor is None:
+        return None
+    # Module-qualified identity so same-named classes in different modules don't collide.
+    proc_cls = type(processor)
+    parts = [f"{proc_cls.__module__}.{proc_cls.__qualname__}"]
+    for attr in ("image_token", "boi_token", "video_token", "image_seq_length"):
+        if hasattr(processor, attr):
+            parts.append(f"{attr}={getattr(processor, attr)!r}")
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is not None:
+        ip_cls = type(image_processor)
+        parts.append(f"image_processor={ip_cls.__module__}.{ip_cls.__qualname__}")
+        for attr in ("size", "patch_size", "merge_size", "min_pixels", "max_pixels"):
+            if hasattr(image_processor, attr):
+                parts.append(f"ip.{attr}={getattr(image_processor, attr)!r}")
+    return "|".join(parts)
+
+
+def _load_or_build_mm_pretrain_cache(
+    pretraining_config: DictDefault,
+    cfg: DictDefault,
+    tokenizer: PreTrainedTokenizer,
+    processor: ProcessorMixin | None,
+) -> Dataset:
+    dataset_hash = generate_pretraining_dataset_hash(
+        cfg,
+        pretraining_config,
+        tokenizer.name_or_path,
+        _processor_fingerprint(processor),
+    )
+
+    loader = FileLockLoader(cfg)
+    try:
+
+        def _load_or_build():
+            cached = load_preprocessed_dataset(cfg, dataset_hash)
+            if cached is not None:
+                return cached
+            return _build_mm_pretrain_cache(
+                pretraining_config, cfg, tokenizer, processor, dataset_hash
+            )
+
+        return loader.load(_load_or_build)
+    finally:
+        loader.cleanup()
+
+
 def _load_streaming_dataset(
     pretraining_config: DictDefault,
     cfg: DictDefault,
     tokenizer: PreTrainedTokenizer,
     processor: ProcessorMixin | None = None,
     is_eval: bool = False,
-) -> IterableDataset:
+) -> IterableDataset | Dataset:
     """Load and prepare a streaming dataset for pretraining."""
+    if _mm_pretrain_cache_enabled(cfg, pretraining_config, is_eval):
+        cached = _load_or_build_mm_pretrain_cache(
+            pretraining_config, cfg, tokenizer, processor
+        )
+        return cached.with_format("torch")
+
     # Create dataset wrapper partial function
     dataset_wrapper_partial = functools.partial(
         get_dataset_wrapper,
@@ -368,7 +492,10 @@ def _load_tokenized_prepared_datasets(
 
     # Generate dataset hash for caching
     dataset_hash = generate_dataset_hash_from_config(
-        cfg, datasets_configs, tokenizer.name_or_path
+        cfg,
+        datasets_configs,
+        tokenizer.name_or_path,
+        _processor_fingerprint(processor),
     )
 
     # Try loading from hub if push_dataset_to_hub is configured
@@ -446,7 +573,10 @@ def _load_raw_datasets(
 
         # Save the prepared dataset
         dataset_hash = generate_dataset_hash_from_config(
-            cfg, datasets_configs, tokenizer.name_or_path
+            cfg,
+            datasets_configs,
+            tokenizer.name_or_path,
+            _processor_fingerprint(processor),
         )
         save_preprocessed_dataset(cfg, dataset, dataset_hash, split)
 

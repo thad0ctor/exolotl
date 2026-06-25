@@ -13,7 +13,7 @@ from axolotl.utils.dict import DictDefault
 def _mm_cpt_cfg(min_base_cfg, **overrides) -> DictDefault:
     base = DictDefault(
         **(
-            min_base_cfg
+            dict(min_base_cfg)
             | {
                 "datasets": None,
                 "pretraining_dataset": [
@@ -30,7 +30,31 @@ def _mm_cpt_cfg(min_base_cfg, **overrides) -> DictDefault:
             }
         )
     )
-    return base | DictDefault(overrides)
+    return DictDefault(dict(base) | dict(overrides))
+
+
+def _mm_cpt_datasets_cfg(min_base_cfg, **overrides) -> DictDefault:
+    base = DictDefault(
+        **(
+            dict(min_base_cfg)
+            | {
+                "datasets": [
+                    {
+                        "path": "some/ds",
+                        "type": "multimodal_pretrain",
+                        "text_column": "caption",
+                        "image_column": "images",
+                        "image_base_dir": "/images",
+                    }
+                ],
+                "pretraining_dataset": None,
+                "streaming": False,
+                "processor_type": "AutoProcessor",
+                "sequence_len": 2048,
+            }
+        )
+    )
+    return DictDefault(dict(base) | dict(overrides))
 
 
 class TestMultimodalCPTGates:
@@ -87,6 +111,64 @@ class TestMultimodalCPTGates:
         pd = validated.pretraining_dataset[0]
         assert pd.type == "multimodal_pretrain"
         assert pd.image_column == "images"
+
+    def test_valid_datasets_cfg_preserves_mm_keys(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg)
+        validated = validate_config(cfg)
+        assert validated.remove_unused_columns is False
+        ds = validated.datasets[0]
+        assert ds.type == "multimodal_pretrain"
+        assert ds.text_column == "caption"
+        assert ds.image_column == "images"
+        assert ds.image_base_dir == "/images"
+
+    def test_datasets_cfg_allows_num_epochs_without_max_steps(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg, num_epochs=2)
+        cfg.pop("max_steps", None)
+        validated = validate_config(cfg)
+        assert validated.max_steps is None
+        assert validated.num_epochs == 2
+
+    def test_datasets_cfg_missing_processor_type_raises(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg)
+        cfg.pop("processor_type", None)
+        with pytest.raises(ValueError, match="processor_type"):
+            validate_config(cfg)
+
+    def test_datasets_cfg_with_streaming_rejected(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg, streaming=True, max_steps=10)
+        with pytest.raises(ValueError, match="non-streaming prepared path"):
+            validate_config(cfg)
+
+    def test_multiple_datasets_entries_rejected(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg)
+        cfg.datasets.append({"path": "other/ds", "type": "alpaca"})
+        with pytest.raises(ValueError, match="exactly one `datasets`"):
+            validate_config(cfg)
+
+    def test_datasets_and_pretraining_mm_entries_rejected(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(
+            min_base_cfg,
+            pretraining_dataset=[{"path": "stream/ds", "type": "multimodal_pretrain"}],
+        )
+        with pytest.raises(
+            ValueError, match="both `pretraining_dataset` and `datasets`"
+        ):
+            validate_config(cfg)
+
+    def test_datasets_cfg_rejects_truncate_strategy(self, min_base_cfg):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg, excess_length_strategy="truncate")
+        with pytest.raises(ValueError, match="excess_length_strategy: truncate"):
+            validate_config(cfg)
+
+    def test_datasets_cfg_requires_strategy_type_not_multimodal_flag(
+        self, min_base_cfg
+    ):
+        cfg = _mm_cpt_datasets_cfg(min_base_cfg)
+        cfg.datasets[0].pop("type")
+        cfg.datasets[0]["multimodal"] = True
+        with pytest.raises(ValueError, match="type: multimodal_pretrain"):
+            validate_config(cfg)
 
     def test_multimodal_flag_triggers_gates(self, min_base_cfg):
         cfg = _mm_cpt_cfg(min_base_cfg)
@@ -147,6 +229,7 @@ class TestMultimodalCPTGates:
         )
         validated = validate_config(cfg)
         td = validated.test_datasets[0]
+        assert td["type"] == "multimodal_pretrain"
         assert td["image_column"] == "imgs2"
         assert td["multimodal"] is True
 

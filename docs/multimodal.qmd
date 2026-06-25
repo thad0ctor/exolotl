@@ -368,18 +368,26 @@ Here is an example of a multi-modal dataset:
 
 Raw image+text continued pretraining — no chat template, no conversational
 scaffolding. The model learns to emit raw text conditioned on visual patches.
-Intended for use cases like OCR/transcription corpora where every row is a
-tight `(image, target_text)` pair and any user/assistant framing would pollute
-the learned signal.
+This is intended for corpora where every row is a tight `(image, target_text)`
+pair and any user/assistant framing would pollute the learned signal.
 
 ::: {.callout-note}
-**Currently supported via the streaming `pretraining_dataset` route only.**
-A non-streaming `datasets:` route (`type: multimodal_pretrain` under
-`datasets:`) is intentionally not wired — the collator selection inside
-`build_collator` only routes MM CPT batches under the pretraining branch.
-Configure MM CPT under `pretraining_dataset:` with `streaming: true` as
-shown below.
+MM CPT supports two raw image+text routes:
+
+- `pretraining_dataset:` with `streaming: true` for iterable streaming.
+- `datasets:` with `type: multimodal_pretrain` for the standard non-streaming
+  prepared dataset pipeline.
+
+The non-streaming path stores token metadata plus image paths in the prepared
+dataset; decoded image tensors are loaded by the collator at batch time.
 :::
+
+Full config examples are available under `examples/qwen2_5-vl/`:
+
+- `mm-cpt-nonstreaming-qlora.yaml` for raw `datasets:`
+  preprocessing plus `num_epochs` based training.
+- `mm-cpt-streaming-qlora.yaml` for streaming `pretraining_dataset:`
+  training with prepared-cache resume.
 
 ### Dataset format (JSONL)
 
@@ -413,7 +421,7 @@ Notes:
 Axolotl autodetects the placeholder from the loaded processor. If autodetection
 fails, supply `image_token: <your token>` on the dataset entry.
 
-### YAML example
+### Streaming YAML example
 
 ```yaml
 base_model: HuggingFaceTB/SmolVLM-500M-Instruct
@@ -436,6 +444,91 @@ remove_unused_columns: false           # auto-set by validator
 max_steps: 10000
 micro_batch_size: 1
 gradient_accumulation_steps: 8
+```
+
+For large streaming runs that need cheap checkpoint resume, set
+`dataset_prepared_path` so Axolotl can cache the tokenized MM CPT rows, and use
+`ignore_data_skip: true` when you prefer resuming optimizer/scheduler state
+without Trainer fast-forwarding through already-seen multimodal batches:
+
+```yaml
+pretraining_dataset:
+  - path: /path/to/shards/*.jsonl
+    ds_type: json
+    type: multimodal_pretrain
+    text_column: text
+    image_column: images
+
+streaming: true
+dataset_prepared_path: ./data/mm-cpt-stream-cache
+ignore_data_skip: true
+max_steps: 10000
+```
+
+### Non-streaming prepared YAML example
+
+```yaml
+base_model: HuggingFaceTB/SmolVLM-500M-Instruct
+processor_type: AutoProcessor
+
+datasets:
+  - path: /path/to/train.jsonl
+    ds_type: json
+    type: multimodal_pretrain
+    text_column: text
+    image_column: images
+    image_base_dir: /path/to/images   # optional, for relative paths
+    # image_token: "<image>"           # optional override; autodetect by default
+
+streaming: false
+dataset_prepared_path: ./data/prepared
+sequence_len: 2048
+sample_packing: false                  # REQUIRED — see below
+remove_unused_columns: false           # auto-set by validator
+
+num_epochs: 1                           # max_steps is optional in this path
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+```
+
+Because this route creates a map-style dataset with a known length, Axolotl can
+infer scheduler/training steps from `num_epochs`; unlike streaming
+`pretraining_dataset`, you do not need to manually calculate `max_steps`.
+
+You can run `axolotl preprocess` on this mode. The prepared Arrow dataset keeps
+`images` as image references and `_mm_text` as raw text for the collator; the
+collator loads images and calls the configured processor during training. If
+your JSONL stores relative image paths, keep `image_base_dir` set in the train
+config that consumes the prepared dataset.
+
+### Already-tokenized MM CPT rows
+
+The non-streaming `datasets:` path also accepts rows that have already been
+tokenized, as long as they still include `_mm_text` and `images` for the
+collator. The collator re-tokenizes `_mm_text` with the processor at batch time
+so image placeholders expand consistently with the loaded model; the stored
+token columns are used by the prepared dataset pipeline and should match the raw
+text.
+
+```yaml
+base_model: HuggingFaceTB/SmolVLM-500M-Instruct
+processor_type: AutoProcessor
+
+datasets:
+  - path: /path/to/pretokenized_mm_cpt.jsonl
+    ds_type: json
+    type: multimodal_pretrain
+
+streaming: false
+skip_prepare_dataset: true
+sequence_len: 2048
+sample_packing: false
+remove_unused_columns: false
+num_epochs: 1
+```
+
+```json
+{"_mm_text": "<image>\nText target.", "images": ["/dataset/image.png"], "input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, 2, 3]}
 ```
 
 ### Eval datasets
@@ -473,6 +566,12 @@ The following combinations are rejected at config-load time with a clear error:
 - `chat_template` set to anything — defeats the purpose of the CPT path.
 - `processor_type` unset — no processor means no image tensors.
 - Multiple MM `test_datasets` entries with mismatched `image_base_dir` or `image_token`.
+- Multiple MM training entries under `datasets:` or `pretraining_dataset:`.
+- `datasets:` MM CPT with `streaming: true` — use `pretraining_dataset:` for
+  streaming and `datasets:` for the non-streaming prepared path.
+- `datasets:` MM CPT with `excess_length_strategy: truncate` — the collator
+  re-tokenizes `_mm_text` at batch time, so truncating only prepared token ids
+  would not truncate the actual model inputs.
 
 In addition, the following model families are **not supported** in v1 and will
 be rejected when their processor is loaded:
