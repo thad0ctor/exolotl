@@ -21,6 +21,7 @@ TOPICS = {
     "pretraining": "docs/agents/pretraining.md",
     "model_architectures": "docs/agents/model_architectures.md",
     "new_model_support": "docs/agents/new_model_support.md",
+    "plugins": "docs/agents/plugins.md",
 }
 
 
