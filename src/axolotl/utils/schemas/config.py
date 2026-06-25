@@ -69,6 +69,61 @@ from axolotl.utils.schemas.vllm import VllmConfig
 LOG = get_logger(__name__)
 
 
+class PluginSpec(BaseModel):
+    """External plugin source: clone/resolve a plugin and load it without modifying
+    the axolotl install."""
+
+    cls: str | list[str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Dotted path(s) to the plugin class(es): a string, or a list to load several classes from one `source`. Optional when `source` is given: the single BasePlugin subclass exported by the source is auto-discovered."
+        },
+    )
+    source: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Git URL or local path to the plugin source. Omit if the class is already importable."
+        },
+    )
+    ref: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Git branch, tag, or commit to check out (a commit SHA is recommended for reproducibility)."
+        },
+    )
+    subdir: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Subdirectory within the source to add to sys.path."
+        },
+    )
+    pip_install: bool | Literal["editable", "requirements"] = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Install the plugin/deps into the active env: 'editable' (pip install -e), 'requirements' (pip install -r requirements.txt), or false for path injection only. Never modifies the axolotl install."
+        },
+    )
+    update: bool = Field(
+        default=False,
+        json_schema_extra={
+            "description": "Re-fetch and re-checkout a git source even if it is already cached."
+        },
+    )
+
+    @field_validator("pip_install")
+    @classmethod
+    def _normalize_pip_install(cls, value):
+        if value is True:
+            return "editable"
+        return value
+
+    @model_validator(mode="after")
+    def _require_cls_or_source(self):
+        if not self.cls and not self.source:
+            raise ValueError("plugin entry needs at least one of `cls` or `source`")
+        return self
+
+
 class EBFTConfig(BaseModel):
     """Configuration for Energy-Based Fine-Tuning (EBFT)"""
 
@@ -1403,10 +1458,16 @@ class AxolotlInputConfig(
         },
     )
 
-    plugins: list[str] | None = Field(
+    plugins: list[str | PluginSpec] | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Add plugins to extend the pipeline. See `src/axolotl/integrations` for the available plugins or doc below for more details. https://docs.axolotl.ai/docs/custom_integrations.html"
+            "description": "Add plugins to extend the pipeline. Each entry is either a dotted class path or a mapping with `cls` plus an external `source` (git URL / local path). See `src/axolotl/integrations` or https://docs.axolotl.ai/docs/custom_integrations.html"
+        },
+    )
+    plugin_cache_dir: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Directory for cloned external plugin sources (default ./.axolotl_plugins/). Overridable via the AXOLOTL_PLUGIN_CACHE_DIR env var."
         },
     )
     generate_samples: bool | None = Field(

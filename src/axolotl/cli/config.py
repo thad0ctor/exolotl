@@ -14,6 +14,7 @@ import yaml
 from transformers.utils import is_torch_bf16_gpu_available, is_torch_tf32_available
 
 from axolotl.integrations.base import PluginManager
+from axolotl.integrations.provisioning import provision_plugins
 from axolotl.telemetry.errors import send_errors
 from axolotl.telemetry.manager import TelemetryManager
 from axolotl.utils.comet_ import setup_comet_env_vars
@@ -213,6 +214,7 @@ def prepare_plugins(cfg: DictDefault):
         cfg: Dictionary mapping `axolotl` config keys to values.
     """
     if cfg.get("plugins"):
+        provision_plugins(cfg)
         plugin_manager = PluginManager.get_instance()
         for plugin_name in cfg["plugins"]:
             plugin_manager.register(plugin_name)

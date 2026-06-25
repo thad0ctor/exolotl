@@ -13,6 +13,7 @@ from transformers.utils.import_utils import (
 
 from axolotl.integrations.base import PluginManager
 from axolotl.integrations.config import merge_input_args
+from axolotl.integrations.provisioning import provision_plugins
 from axolotl.loaders import MULTIMODAL_AUTO_MODEL_MAPPING
 from axolotl.loaders.utils import load_model_config
 from axolotl.utils.bench import log_gpu_memory_usage
@@ -386,6 +387,7 @@ def prepare_plugins(cfg):
     """
 
     if cfg.get("plugins"):
+        provision_plugins(cfg)
         plugin_manager = PluginManager.get_instance()
         for plugin_name in cfg["plugins"]:
             plugin_manager.register(plugin_name)

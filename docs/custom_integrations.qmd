@@ -119,3 +119,95 @@ It is not necessary to place your integration in the `integrations` folder. It c
 See this repo for an example: [https://github.com/axolotl-ai-cloud/diff-transformer](https://github.com/axolotl-ai-cloud/diff-transformer)
 
 :::
+
+## External plugin sources
+
+To use a third-party plugin without modifying your Axolotl checkout or manually
+installing it, a `plugins:` entry may be a mapping that points at an external
+**git repository or local directory**. Axolotl clones (or resolves) the source into
+a cache directory, adds it to `sys.path`, and then loads the class — your Axolotl
+install is never touched.
+
+```yaml
+plugins:
+  # Existing form — a dotted class path — is unchanged.
+  - axolotl.integrations.liger.LigerPlugin
+
+  # External git source — `cls` auto-discovered from the package (see convention below).
+  - source: https://github.com/org/repo.git        # git URL (or local path)
+    ref: v1.2.0                                     # branch / tag / commit (SHA recommended)
+
+  # Explicit class + options.
+  - cls: my_plugin.MyPlugin                         # dotted path to the plugin class
+    source: https://github.com/org/repo.git
+    subdir: src                                     # dir within the source to put on sys.path
+    pip_install: editable                           # false | editable | requirements
+
+  # Multiple plugins from one repo — cloned once, several classes loaded.
+  - source: https://github.com/org/multi-plugin.git
+    ref: v1.0.0
+    cls: [multi_pkg.AlphaPlugin, multi_pkg.BetaPlugin]
+
+  # Local directory source (no clone).
+  - source: ./plugins/local_plugin
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `cls` | no¹ | Dotted path to the plugin class — a string, or a **list** to load several classes from one `source`. Auto-discovered from `source` when omitted (see convention below). |
+| `source` | no¹ | Git URL or local path. A value ending in `.git` or starting with `http(s)://`, `git://`, `ssh://`, or `git@` is cloned; anything else is treated as a local path. Omit if the class is already importable. |
+| `ref` | no | Git branch, tag, or commit to check out. Pin to a commit SHA for reproducibility. |
+| `subdir` | no | Subdirectory within the source added to `sys.path`. |
+| `pip_install` | no | `false` (default) injects the path only; `editable` runs `pip install -e` on the source (falling back to `requirements` if it isn't a package); `requirements` installs `requirements.txt` only. |
+| `update` | no | Re-fetch and re-checkout a cached git source. |
+
+¹ At least one of `cls` or `source` is required.
+
+### Plugin convention (so `cls` can be auto-discovered)
+
+When `cls` is omitted, Axolotl imports the package(s) under the source (or its
+`subdir`) and uses the **single `BasePlugin` subclass** it finds. To make a plugin
+discoverable, follow this minimal convention:
+
+- ship it as an **importable package** whose top-level `__init__.py` **exports the
+  plugin class**, and
+- export **exactly one** `BasePlugin` subclass.
+
+The simplest layout needs no `subdir`:
+
+```
+my-plugin/
+├── pyproject.toml
+└── my_plugin/
+    ├── __init__.py     # from .plugin import MyPlugin;  __all__ = ["MyPlugin"]
+    └── plugin.py       # class MyPlugin(BasePlugin): ...
+```
+
+```yaml
+plugins:
+  - source: https://github.com/org/my-plugin.git
+    ref: v1.0.0
+```
+
+Discovery skips `tests/`, `docs/`, `examples/`, and similar directories. If it finds
+zero or several plugin classes, it raises and asks you to set `cls` explicitly — so
+`cls` remains the override for multi-plugin repos, non-standard layouts, or
+already-installed packages.
+
+### Cache directory
+
+Cloned sources live in `./.axolotl_plugins/` by default. Override with the
+`plugin_cache_dir:` config key or the `AXOLOTL_PLUGIN_CACHE_DIR` environment
+variable (e.g. `~/.cache/axolotl/plugins` to share clones across checkouts). The
+cache directory writes its own `.gitignore`, so a vanilla Axolotl checkout stays
+clean without edits to the repo's root `.gitignore`.
+
+::: {.callout-warning}
+
+External sources execute arbitrary code at import time — only point `source:` at
+repositories you trust, and pin `ref:` to a specific commit. Cloning itself runs no
+repository code, and no automatic installation happens unless you set
+`pip_install`. When `pip_install` is set, only the plugin and its dependencies are
+installed; the Axolotl install itself is never modified.
+
+:::
