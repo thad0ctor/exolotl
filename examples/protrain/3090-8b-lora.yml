@@ -1,0 +1,116 @@
+# ProTrain 8B LoRA on a single RTX 3090 (24 GB)
+#
+# Opts into the ProTrain plugin via `plugins:`. The plugin's post_model_load
+# hook wraps the model with the hierarchical chunk manager + interleaved
+# block manager. The plugin's post_trainer_create hook then installs
+# `protrain_optimizer_wrapper` on trainer.optimizer — this is the real
+# wiring path because Axolotl's OptimizerMixin.create_optimizer does NOT
+# dispatch to PluginManager.create_optimizer (see plugin.py for why).
+#
+# Mode selection is automatic. Leave ``protrain_auto_mode`` on (default);
+# the plugin runs the searcher and then picks Mode A (GPU-resident / DDP-
+# friendly), Mode B (replicated CPU-offload), or Mode C (ZeRO-3 sharded
+# CPU-offload) based on the model's fit and per-rank CPU RAM. For 7B/8B
+# LoRA on a single 24 GB 3090 the selector picks Mode A — the frozen
+# base fits in fp16 alongside LoRA optimizer state + activations, and
+# DDP scales at ~3.6x on a non-NVLink 4x 3090 rig while ZeRO-3 sharding
+# on the same rig lands at ~0.7x (see DESIGN.md §Multi-GPU).
+#
+# Set ``protrain_auto_mode: false`` below only if you need explicit
+# control (reproducing a specific benchmark configuration, or a
+# heterogeneous-CPU setup where the node-RAM/world-size heuristic is
+# wrong). In that case ``protrain_force_all_persistent`` and
+# ``protrain_zero3_shard`` become the explicit overrides.
+
+# NousResearch/Meta-Llama-3-8B-Instruct is the 8B-class Llama mirror on HF
+# Hub that is *not* gated (public-license, no HF-terms accept step). It was
+# chosen over mistralai/Mistral-7B-v0.3 (gated: 401 for new users) and
+# meta-llama/Llama-3.1-8B (gated: requires accepted license) for frictionless
+# downloads in CI and first-run contributors. HuggingFaceH4/zephyr-7b-beta is
+# an equivalent ungated fallback if the Llama arch is undesirable.
+base_model: NousResearch/Meta-Llama-3-8B-Instruct
+model_type: LlamaForCausalLM
+
+load_in_8bit: false
+load_in_4bit: false
+strict: false
+
+datasets:
+  - path: tatsu-lab/alpaca
+    type: alpaca
+val_set_size: 0.0
+output_dir: ./outputs/protrain-3090-8b-lora
+
+sequence_len: 256          # small to keep activation memory low
+sample_packing: false
+pad_to_sequence_len: false
+
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - up_proj
+  - down_proj
+  - gate_proj
+
+plugins:
+  - axolotl.integrations.protrain.ProTrainPlugin
+
+# -- ProTrain knobs (see axolotl.integrations.protrain.args.ProTrainArgs) --
+protrain_auto_memory: true
+# Keep explicit for reproducibility across future default changes.
+protrain_auto_mode: true
+# protrain_force_all_persistent: true   # explicit override (only honoured when protrain_auto_mode=false)
+
+gradient_accumulation_steps: 4
+micro_batch_size: 1
+max_steps: 20
+optimizer: adamw_torch      # adamw_torch baseline; ProTrainPlugin.post_trainer_create replaces this with protrain_optimizer_wrapper
+lr_scheduler: cosine
+learning_rate: 0.0002
+
+bf16: true
+fp16: false
+tf32: false
+
+# IMPORTANT: the ProTrain block manager installs its own CKPT hooks when
+# the searcher assigns a block to CKPT mode (typical for tight-capacity
+# offload configs). Enabling Axolotl / HuggingFace gradient checkpointing
+# here would double-checkpoint the forward pass — and the ProTrainArgs
+# validator will refuse the config.
+gradient_checkpointing: false
+
+# M0 spike validated FA composes cleanly with ProTrain on this config.
+flash_attention: true
+xformers_attention: false
+
+# IMPORTANT: Axolotl auto-enables fused Triton LoRA kernels (q/k/v/o/MLP)
+# when these flags are unset. Those kernels read raw weight tensors
+# directly via torch.matmul; ProTrain's profiler engages "on-demand"
+# mode for 7B+ models on a 24 GB card (model state > 60% of device
+# memory) and offloads params to CPU between modules using forward
+# hooks. The Axolotl LoRA kernels bypass nn.Linear's standard forward
+# hook machinery, so the offload-then-restore pattern does not see
+# them and they read empty/CPU tensors -> RuntimeError("size mismatch
+# ... vec (0)") inside matmul_lora. Disable them here to keep the
+# stock PEFT LoRA forward path (which IS hookable) so the profiler's
+# on-demand pass works. The performance cost is ~5-10% on this
+# 7B-class workload — acceptable for the M5 acceptance run, and the
+# steady-state runtime under the chunk manager itself is dominated by
+# H2D/D2H traffic rather than LoRA matmul throughput.
+lora_mlp_kernel: false
+lora_qkv_kernel: false
+lora_o_kernel: false
+
+logging_steps: 1
+save_steps: 20
+save_first_step: false
+save_total_limit: 1
+
+warmup_steps: 2
+weight_decay: 0.0

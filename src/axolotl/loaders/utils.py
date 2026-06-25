@@ -14,6 +14,29 @@ from axolotl.utils.logging import get_logger
 LOG = get_logger(__name__)
 
 
+# ProTrain upcasts embed/lm_head lazily in forward, so the load-time fp32 cast
+# in ``_convert_embedding_modules_dtype`` would needlessly OOM 27B + 4-bit on a
+# 24 GiB card. Keep this loader-side predicate decoupled from integration
+# imports, but require the same dual gate as the plugin runtime.
+_PROTRAIN_PLUGIN_ID = "axolotl.integrations.protrain.ProTrainPlugin"
+
+
+def is_protrain_plugin_registered(cfg) -> bool:
+    """Return True iff ProTrain is registered in ``cfg.plugins``."""
+    plugins = getattr(cfg, "plugins", None) or []
+    if not isinstance(plugins, (list, tuple, set, frozenset)):
+        return False
+    return any(isinstance(p, str) and p == _PROTRAIN_PLUGIN_ID for p in plugins)
+
+
+def is_protrain_active(cfg) -> bool:
+    """Return True iff ProTrain is registered and explicitly enabled."""
+    return bool(
+        getattr(cfg, "protrain_auto_memory", False)
+        and is_protrain_plugin_registered(cfg)
+    )
+
+
 def get_module_class_from_name(
     module: torch.nn.Module, name: str
 ) -> Type[torch.nn.Module] | None:
