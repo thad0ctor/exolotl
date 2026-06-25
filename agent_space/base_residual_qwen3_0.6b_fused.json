@@ -1,0 +1,49 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "base_class": "NVFP4FastComputeBaseLinear",
+  "n_linears": 196,
+  "calib_tokens": 512,
+  "eval_tokens": 512,
+  "load_overhead_s": {
+    "calibration_forward": 0.41934776795096695,
+    "svd_total_rank16": 11.78706478793174
+  },
+  "whole_model_step_ms": {
+    "base": 163.21479401085526,
+    "with_residuals": 196.71866903081536
+  },
+  "whole_model_step_compiled_ms": {
+    "base": 103.16291602794081,
+    "with_residuals": 125.02353801392019
+  },
+  "one_linear_step_ms": {
+    "base": 0.6738969823345542,
+    "with_residual": 0.8817630587145686
+  },
+  "results": {
+    "fp4_baseline": {
+      "kl": 0.0739068181719631,
+      "top1": 0.951171875
+    },
+    "plain_k16": {
+      "kl": 0.06617263052612543,
+      "top1": 0.939453125,
+      "svd_s": 11.922583170002326
+    },
+    "l2qer_k8": {
+      "kl": 0.06385804014280438,
+      "top1": 0.947265625,
+      "svd_s": 11.74480292503722
+    },
+    "l2qer_k16": {
+      "kl": 0.04985679290257394,
+      "top1": 0.94921875,
+      "svd_s": 11.78706478793174
+    },
+    "l2qer_k32": {
+      "kl": 0.04312016163021326,
+      "top1": 0.958984375,
+      "svd_s": 11.752057865960523
+    }
+  }
+}

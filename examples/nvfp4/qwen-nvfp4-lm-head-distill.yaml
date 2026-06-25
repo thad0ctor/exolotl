@@ -1,0 +1,83 @@
+# NVFP4 FP4 lm_head + KL-distillation accuracy recovery.
+#
+# `quantize_lm_head: true` freezes the output projection on its NVFP4 grid. That
+# frozen weight adds ~9.5% uniform e2m1 mantissa noise (~21% argmax flips, all
+# near-ties; ~+0.04 nats CE on an 8B head) and CANNOT be moved off the grid. The
+# trainable body CAN adapt to it: `lm_head_distillation` adds a KL aux-loss against
+# the ORIGINAL bf16 head (retained frozen at swap time), so the body learns to emit
+# hidden states whose FP4 logits match the bf16-head logits.
+#
+#   total = CE_student + lambda * T^2 * KL(softmax(z_teacher/T) || softmax(z_student/T))
+#
+# The FP4 head exists for SPEED, so the levers below bound the per-step teacher
+# cost (the teacher matmul over the full vocab is the dominant cost):
+#   * top_k   — bound the KL math to k teacher tokens + one aggregated tail bucket;
+#   * cadence — apply the KL term only every N steps (amortize the teacher forward,
+#               the biggest speed lever);
+#   * the teacher logits are always computed in vocab tiles (peak memory bounded).
+base_model: Qwen/Qwen3-0.6B
+
+load_in_8bit: false
+load_in_4bit: false
+strict: false
+
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+datasets:
+  - path: yahma/alpaca-cleaned
+    type: alpaca
+
+output_dir: ./outputs/nvfp4_lm_head_distill_out/
+
+sequence_len: 2048
+sample_packing: true
+pad_to_sequence_len: true
+
+bf16: true
+torch_compile: false
+
+nvfp4_training:
+  enabled: true
+  quantize_base: true            # FP4 storage on the frozen LoRA base
+  quantize_lm_head: true         # FP4-quantize the output projection (frozen)
+  fused_fp4_cross_entropy: true  # tiled FP4 CE — skip materializing logits
+  stochastic_rounding: true
+  hadamard: true
+  exclude_modules: [embed_tokens]
+
+  # KL-distillation against the retained bf16 head (recover the FP4 head's accuracy).
+  # OFF by default; gated to quantize_lm_head. Recommended default keeps most of the
+  # FP4 head speed: top_k bounds the KL math and cadence amortizes the teacher pass.
+  lm_head_distillation:
+    enabled: true
+    lambda: 1.0          # weight on the KL term
+    temperature: 1.0     # softmax temperature (grad scaled by T^2)
+    top_k: 128           # distill top-128 teacher logits + a tail bucket
+    cadence: 4           # apply the KL term every 4 steps (amortize the teacher)
+    teacher: live        # 'live' = recompute tiled teacher logits; 'precomputed' = stub
+    teacher_vocab_block: 8192
+
+gradient_accumulation_steps: 1
+micro_batch_size: 1
+num_epochs: 1
+optimizer: adamw_torch_fused
+learning_rate: 2e-4
+
+logging_steps: 1
+warmup_steps: 10
+weight_decay: 0.0
+max_steps: 20
+save_only_model: true
+
+special_tokens:

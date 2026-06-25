@@ -223,6 +223,48 @@ class TestLegacyFlagDeprecation:
         with pytest.raises(ValueError, match="cannot be combined with legacy"):
             validate_config(cfg)
 
+    def test_sage_fp4_config_block_uses_new_key(self, min_base_cfg):
+        cfg = min_base_cfg | DictDefault(
+            attn_implementation="sage_fp4",
+            sage_fp4_attention={"allow_fallback": False},
+        )
+        validated = validate_config(cfg)
+        assert validated.attn_implementation == "sage_fp4"
+        assert validated.sage_fp4_attention.allow_fallback is False
+
+    def test_dict_sage_attention_migrates_to_sage_fp4_config(self, min_base_cfg):
+        cfg = min_base_cfg | DictDefault(
+            attn_implementation="sage_fp4",
+            sage_attention={"allow_fallback": False},
+        )
+        validated = validate_config(cfg)
+        assert validated.sage_fp4_attention.allow_fallback is False
+
+    def test_dict_sage_attention_and_new_key_rejected(self, min_base_cfg):
+        cfg = min_base_cfg | DictDefault(
+            attn_implementation="sage_fp4",
+            sage_attention={"allow_fallback": False},
+            sage_fp4_attention={"allow_fallback": True},
+        )
+        with pytest.raises(ValueError, match="sage_fp4_attention"):
+            validate_config(cfg)
+
+    def test_sage_fp4_rejected_for_train_mode(self, min_base_cfg):
+        cfg = min_base_cfg | DictDefault(
+            axolotl_cli_mode="train",
+            attn_implementation="sage_fp4",
+        )
+        with pytest.raises(ValueError, match="inference-only"):
+            validate_config(cfg)
+
+    def test_sage_fp4_allowed_for_inference_mode(self, min_base_cfg):
+        cfg = min_base_cfg | DictDefault(
+            axolotl_cli_mode="inference",
+            attn_implementation="sage_fp4",
+        )
+        validated = validate_config(cfg)
+        assert validated.attn_implementation == "sage_fp4"
+
 
 class TestCanonicalValueAcceptance:
     """`attn_implementation` accepts canonical names and `org/name` hub-kernel

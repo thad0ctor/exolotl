@@ -109,6 +109,7 @@ CANONICAL_ATTN_IMPLS = frozenset(
         "flex_attention",
         "xformers",
         "sage",
+        "sage_fp4",
         "fp8",
     }
 )
