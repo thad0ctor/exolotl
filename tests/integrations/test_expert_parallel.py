@@ -178,10 +178,10 @@ class TestShardingSingleRank:
 
     def setup_method(self):
         if not dist.is_initialized():
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29555")
-            os.environ.setdefault("RANK", "0")
-            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(_find_free_port())
+            os.environ["RANK"] = "0"
+            os.environ["WORLD_SIZE"] = "1"
             dist.init_process_group(backend="gloo", rank=0, world_size=1)
 
     def teardown_method(self):

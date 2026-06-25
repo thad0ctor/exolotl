@@ -411,6 +411,8 @@ def fused_rms_norm_rope(x, weight, cos, sin, eps=1e-6, unit_offset=False):
     """
     shape = x.shape  # (B, S, H, D)
     B, S, H, D = shape
+    if weight.ndim != 1 or weight.shape[0] != D:
+        raise ValueError(f"weight must have shape ({D},), got {tuple(weight.shape)}")
     n_rot = cos.shape[-1]
     if sin.shape[-1] != n_rot:
         raise ValueError(

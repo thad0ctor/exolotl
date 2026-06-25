@@ -293,6 +293,8 @@ def save_trained_model(
             # final model weights have already been saved by `ReLoRACallback.on_train_end`
             return
 
+    _restore_protrain_fullft_offload_for_save(cfg, trainer)
+
     if trainer.is_fsdp_enabled or cfg.fsdp_config:
         if cfg.fsdp_config or cfg.fsdp:
             if cfg.fsdp_config.final_state_dict_type:
@@ -369,10 +371,15 @@ def save_trained_model(
             except FileNotFoundError:
                 pass
     elif cfg.local_rank == 0:
+        protrain_state_dict = _protrain_state_dict_for_save(cfg, model)
         if cfg.rl and cfg.adapter and not cfg.rl_adapter_ref_model:
-            trainer.model.save_pretrained(cfg.output_dir)
+            trainer.model.save_pretrained(
+                cfg.output_dir,
+                state_dict=protrain_state_dict,
+            )
 
-        model.save_pretrained(cfg.output_dir)
+        model.save_pretrained(cfg.output_dir, state_dict=protrain_state_dict)
+        _normalize_protrain_saved_safetensors(cfg)
 
     if hasattr(cfg, "llmcompressor") and cfg.llmcompressor:
         # TODO: add integration support so this can be implemented completely within the plugin
@@ -386,6 +393,43 @@ def save_trained_model(
         )
 
     LOG.info(f"Model successfully saved to {cfg.output_dir}")
+
+
+def _restore_protrain_fullft_offload_for_save(cfg: DictDefault, trainer: Any) -> None:
+    if getattr(cfg, "_protrain_wrapped", None) is None:
+        return
+
+    from axolotl.integrations.protrain.plugin import restore_fullft_offload_for_save
+
+    restore_fullft_offload_for_save(cfg)
+
+    accelerator = getattr(trainer, "accelerator", None)
+    if accelerator is not None and hasattr(accelerator, "wait_for_everyone"):
+        accelerator.wait_for_everyone()
+        return
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _protrain_state_dict_for_save(cfg: DictDefault, model: Any):
+    if getattr(cfg, "_protrain_wrapped", None) is None:
+        return None
+
+    from axolotl.integrations.protrain.plugin import normalize_state_dict_for_save
+
+    return normalize_state_dict_for_save(cfg, model.state_dict())
+
+
+def _normalize_protrain_saved_safetensors(cfg: DictDefault) -> None:
+    if getattr(cfg, "_protrain_wrapped", None) is None:
+        return
+
+    from axolotl.integrations.protrain.plugin import (
+        normalize_saved_safetensors_for_save,
+    )
+
+    normalize_saved_safetensors_for_save(cfg, cfg.output_dir)
 
 
 def create_model_card(cfg: DictDefault, trainer: Trainer):

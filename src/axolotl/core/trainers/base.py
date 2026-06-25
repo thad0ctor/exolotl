@@ -26,9 +26,9 @@ from torch.utils.data import (
     SequentialSampler,
 )
 from transformers import PreTrainedModel, Trainer
-from transformers.trainer import TRAINING_ARGS_NAME
+from transformers.trainer import TRAINER_STATE_NAME, TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, has_length, seed_worker
-from transformers.utils import SAFE_WEIGHTS_NAME, is_peft_available
+from transformers.utils import SAFE_WEIGHTS_NAME, WEIGHTS_NAME, is_peft_available
 from trl.experimental.utils import pad_to_length
 from typing_extensions import override
 
@@ -49,7 +49,7 @@ from axolotl.core.trainers.utils import (
     trainable_tokens_per_sec_per_gpu,
 )
 from axolotl.utils import get_not_null
-from axolotl.utils.bench import get_gpu_memory_usage
+from axolotl.utils.bench import _gather_per_rank_peak_bytes, get_gpu_memory_usage
 from axolotl.utils.dict import DictDefault
 from axolotl.utils.distributed import (
     get_world_size,
@@ -735,15 +735,35 @@ class AxolotlTrainer(
             except OverflowError:
                 logs["eval_ppl"] = float("inf")
 
-        if is_main_process():
-            # Add memory usage
-            try:
-                active, allocated, reserved = get_gpu_memory_usage()
-                logs["memory/max_active (GiB)"] = round(active, 2)
-                logs["memory/max_allocated (GiB)"] = round(allocated, 2)
-                logs["memory/device_reserved (GiB)"] = round(reserved, 2)
-            except (ValueError, TypeError, FileNotFoundError):
-                pass
+        # Capture local memory stats on every rank so the cluster-wide
+        # peak collective sees a value from each participant. Rank-0-only
+        # gathering would hang under NCCL.
+        local_active_gib = 0.0
+        local_allocated_gib = 0.0
+        local_reserved_gib = 0.0
+        memory_read_ok = False
+        try:
+            local_active_gib, local_allocated_gib, local_reserved_gib = (
+                get_gpu_memory_usage()
+            )
+            memory_read_ok = True
+        except (ValueError, TypeError, FileNotFoundError):
+            memory_read_ok = False
+
+        local_active_bytes = int(local_active_gib * (1024**3)) if memory_read_ok else 0
+        cluster_active_bytes, per_rank_active_bytes = _gather_per_rank_peak_bytes(
+            local_active_bytes
+        )
+
+        if is_main_process() and memory_read_ok:
+            cluster_active_gib = cluster_active_bytes / (1024.0**3)
+            logs["memory/max_active (GiB)"] = round(cluster_active_gib, 2)
+            logs["memory/max_allocated (GiB)"] = round(local_allocated_gib, 2)
+            logs["memory/device_reserved (GiB)"] = round(local_reserved_gib, 2)
+            if len(per_rank_active_bytes) > 1:
+                logs["memory/per_rank_active (GiB)"] = [  # type: ignore[assignment]
+                    round(b / (1024.0**3), 2) for b in per_rank_active_bytes
+                ]
 
         if (
             self.args.include_tkps
@@ -818,6 +838,9 @@ class AxolotlTrainer(
             with open(tokens_state_path, "w", encoding="utf-8") as f:
                 json.dump(tokens_state, f)
 
+        if self._is_protrain_terminal_checkpoint():
+            self._presave_protrain_terminal_checkpoint_state(output_dir)
+        self._restore_protrain_fullft_offload_for_terminal_checkpoint()
         result = super()._save_checkpoint(model, trial, **kwargs)
 
         # Reclaim VRAM held by the FSDP full-state-dict gather.
@@ -827,12 +850,107 @@ class AxolotlTrainer(
 
         return result
 
+    def _is_protrain_terminal_checkpoint(self) -> bool:
+        cfg = self.axolotl_cfg
+        if cfg is None or getattr(cfg, "_protrain_wrapped", None) is None:
+            return False
+
+        control = getattr(self, "control", None)
+        if bool(getattr(control, "should_training_stop", False)):
+            return True
+
+        global_step = int(getattr(self.state, "global_step", 0) or 0)
+        max_steps = int(
+            getattr(self.state, "max_steps", 0)
+            or getattr(self.args, "max_steps", 0)
+            or 0
+        )
+        return max_steps > 0 and global_step >= max_steps
+
+    def _presave_protrain_terminal_checkpoint_state(self, output_dir: str) -> None:
+        if not self.args.save_only_model:
+            self._save_optimizer_and_scheduler(output_dir)
+            self._save_scaler(output_dir)
+            self._save_rng_state(output_dir)
+            self._save_protrain_optimizer_state_for_checkpoint(output_dir)
+
+        if self.args.should_save:
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+    def _save_protrain_optimizer_state_for_checkpoint(self, output_dir: str) -> None:
+        cfg = self.axolotl_cfg
+        if cfg is None or not bool(
+            getattr(cfg, "protrain_save_optimizer_state", False)
+        ):
+            return
+
+        from axolotl.integrations.protrain.api.checkpoint import (
+            DEFAULT_SAVE_MAX_BYTES,
+            _save_protrain_optim_dir,
+            _unwrap_protrain_optim,
+        )
+
+        raw = _unwrap_protrain_optim(getattr(self, "optimizer", None))
+        if raw is None:
+            return
+
+        cfg_max = getattr(cfg, "protrain_optim_save_max_bytes", None)
+        save_max = int(cfg_max) if cfg_max is not None else DEFAULT_SAVE_MAX_BYTES
+        _save_protrain_optim_dir(
+            raw,
+            output_dir,
+            step=int(getattr(self.state, "global_step", 0) or 0),
+            save_max_bytes=save_max,
+            rank=int(getattr(self.args, "process_index", 0)),
+            world_size=int(getattr(self.args, "world_size", 1)),
+        )
+
+    def _restore_protrain_fullft_offload_for_terminal_checkpoint(self) -> None:
+        if not self._is_protrain_terminal_checkpoint():
+            return
+
+        from axolotl.integrations.protrain.plugin import restore_fullft_offload_for_save
+
+        restore_fullft_offload_for_save(self.axolotl_cfg)
+
+        if self.accelerator is not None and hasattr(
+            self.accelerator, "wait_for_everyone"
+        ):
+            self.accelerator.wait_for_everyone()
+            return
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+    def _normalize_protrain_state_dict_for_save(self, state_dict):
+        cfg = self.axolotl_cfg
+        if cfg is None or getattr(cfg, "_protrain_wrapped", None) is None:
+            return state_dict
+
+        from axolotl.integrations.protrain.plugin import normalize_state_dict_for_save
+
+        if state_dict is None:
+            state_dict = self.model.state_dict()
+        return normalize_state_dict_for_save(cfg, state_dict)
+
+    def _normalize_protrain_saved_safetensors(self, output_dir: str) -> None:
+        cfg = self.axolotl_cfg
+        if cfg is None or getattr(cfg, "_protrain_wrapped", None) is None:
+            return
+
+        from axolotl.integrations.protrain.plugin import (
+            normalize_saved_safetensors_for_save,
+        )
+
+        normalize_saved_safetensors_for_save(cfg, output_dir)
+
     # TODO(wing): remove once https://github.com/huggingface/transformers/pull/39866/files is merged
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         LOG.info(f"Saving model checkpoint to {output_dir}")
+        state_dict = self._normalize_protrain_state_dict_for_save(state_dict)
 
         # fix for Context Parallel save: CP eval invalidates tensor storage
         # pointers, so clone to CPU to get fresh valid storage for safetensors
@@ -852,6 +970,7 @@ class AxolotlTrainer(
             if not is_peft_available()
             else (PreTrainedModel, PeftModel)
         )
+        safe_serialization = bool(getattr(self.args, "save_safetensors", True))
         # Save a trained model and configuration using `save_pretrained()`.
         # They can then be reloaded using `from_pretrained()`
         if not isinstance(self.model, supported_classes):
@@ -868,22 +987,28 @@ class AxolotlTrainer(
                     output_dir,
                     state_dict=state_dict,
                     is_main_process=self.accelerator.is_main_process,
+                    safe_serialization=safe_serialization,
                 )
             else:
                 LOG.info(
                     "Trainer.model is not a `PreTrainedModel`, only saving its state dict."
                 )
-                safetensors.torch.save_file(
-                    state_dict,
-                    os.path.join(output_dir, SAFE_WEIGHTS_NAME),
-                    metadata={"format": "pt"},
-                )
+                if safe_serialization:
+                    safetensors.torch.save_file(
+                        state_dict,
+                        os.path.join(output_dir, SAFE_WEIGHTS_NAME),
+                        metadata={"format": "pt"},
+                    )
+                else:
+                    torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
         else:
             self.model.save_pretrained(
                 output_dir,
                 state_dict=state_dict,
                 is_main_process=self.accelerator.is_main_process,
+                safe_serialization=safe_serialization,
             )
+        self._normalize_protrain_saved_safetensors(output_dir)
 
         if self.processing_class is not None:
             self.processing_class.save_pretrained(output_dir)

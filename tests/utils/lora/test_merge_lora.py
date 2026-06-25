@@ -247,6 +247,21 @@ class TestEfficientMerge:
         a, b = find_lora_weights(lora_state, "layers.0.self_attn.v_proj.weight")
         assert a is None and b is None
 
+    def test_find_lora_weights_with_protrain_block_infix(self):
+        prefix = "base_model.model.model.language_model.layers.0.block.mlp.down_proj"
+        lora_state = {
+            f"{prefix}.lora_A.weight": torch.randn(8, 32),
+            f"{prefix}.lora_B.weight": torch.randn(32, 8),
+        }
+
+        a, b = find_lora_weights(
+            lora_state,
+            "model.language_model.layers.0.mlp.down_proj.weight",
+        )
+
+        assert a is not None and b is not None
+        assert a.shape == (8, 32)
+
     def test_merge_tensor_basic(self):
         hidden = 32
         r = 8
