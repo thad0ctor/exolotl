@@ -1329,6 +1329,7 @@ class ChatTemplateStrategy(PromptTokenizingStrategy):
         images = prompt.get(self.images, None)
         if images is None or self.image_size is None:
             return images
+
         # Honor cfg.image_size like the eager collator path does.
         def _resize(image):
             return load_and_resize_image(
