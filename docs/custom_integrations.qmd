@@ -499,3 +499,150 @@ are also supported. AWS OIDC/assume-role and GCP OIDC require a Truss release
 whose training `DockerAuth` model includes those fields; see
 [Baseten DockerAuth](https://docs.baseten.co/reference/sdk/training#dockerauth).
 Use a Truss version that supports the chosen authentication method.
+
+## External plugin sources
+
+Third-party plugins are installed with an explicit command, then referenced from your
+config. Installing and training are two separate steps: loading a config never fetches,
+builds, or installs anything.
+
+### 1. Install the plugin
+
+```bash
+axolotl plugins install https://github.com/org/repo.git --ref 4f2a9c1e8b7d6a5c4b3a2918f7e6d5c4b3a29187
+axolotl plugins install ./plugins/local_plugin          # local directory
+```
+
+The command prints what it is about to do — source, ref, the commit SHA it resolved, and
+whether it will `pip install` the package or add it to `sys.path` — and asks for
+confirmation before running any of the source's code.
+
+| Option | Description |
+|--------|-------------|
+| `--ref` | Git branch, tag, or commit to check out. Pin to a full commit SHA; a branch or tag prints a warning (git sources only). |
+| `--subdir` | Subdirectory within the source that holds the plugin package. |
+| `--cls` | Dotted path to the plugin class. Repeatable. Auto-discovered when omitted (see convention below). |
+| `--mode` | `auto` (default) pip installs a real Python package and otherwise loads from the source tree; `pip` and `syspath` force one or the other. |
+| `--cache-dir` | Where fetched sources and the manifest live. |
+| `--update` | Re-fetch a source that is already cached. |
+| `--yes` / `-y` | Skip the confirmation prompt. |
+
+A **local** path is installed editable (`pip install -e`), so the plugin tracks your
+working tree; a git source is installed from the commit it resolved. When the source is
+loaded from its tree rather than pip installed, a `requirements.txt` at its root is
+installed too.
+
+On success it prints the YAML to paste into your config.
+
+### 2. Reference it from the config
+
+```yaml
+plugins:
+  # Existing form — a dotted class path — is unchanged.
+  - axolotl.integrations.liger.LigerPlugin
+
+  # An externally installed plugin, with the provenance it was installed from.
+  - cls: my_plugin.MyPlugin
+    source: https://github.com/org/repo.git
+    ref: 4f2a9c1e8b7d6a5c4b3a2918f7e6d5c4b3a29187
+
+  # Several classes from one source.
+  - cls: [multi_pkg.AlphaPlugin, multi_pkg.BetaPlugin]
+    source: https://github.com/org/multi-plugin.git
+
+  # `cls` may be omitted — it is looked up in the manifest by source.
+  - source: ./plugins/local_plugin
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `cls` | no¹ | Dotted path to the plugin class — a string, or a **list** to reference several classes installed from one `source`. Looked up in the manifest by `source` when omitted. |
+| `source` | no¹ | Git URL or local path the plugin was installed from. Records provenance and tells Axolotl which install command to suggest when the plugin is missing; it is never fetched at config load. |
+| `ref` | no | Branch, tag, or commit the plugin was installed at. A commit SHA is recommended for reproducibility, and matches an install recorded either by that ref or by the SHA it resolved to. |
+| `subdir` | no | Subdirectory within the source that held the plugin package. |
+
+¹ At least one of `cls` or `source` is required.
+
+The old `pip_install:` and `update:` fields are gone, and a config that still sets them
+is rejected with the `axolotl plugins install` flag that replaced it.
+
+Config load only verifies: it reads the manifest, restores any recorded `sys.path`
+entries, and checks that each class really imports. If it doesn't — the plugin is
+missing, one of its own dependencies is missing, or `cls` names an attribute the module
+does not have — Axolotl fails with the exact `axolotl plugins install` command to run,
+rather than dropping the plugin and training on without it. Mapping entries are
+normalized to dotted class paths before validation, so all downstream code still sees a
+`list[str]`.
+
+### Plugin convention (so `cls` can be auto-discovered)
+
+When `--cls` is not passed at install time, Axolotl imports the package(s) under the
+source (or its `subdir`) and uses the **single `BasePlugin` subclass** it finds. To make
+a plugin discoverable, follow this minimal convention:
+
+- ship it as an **importable package** whose top-level `__init__.py` **exports the
+  plugin class**, and
+- export **exactly one** `BasePlugin` subclass.
+
+The simplest layout needs no `subdir`:
+
+```
+my-plugin/
+├── pyproject.toml
+└── my_plugin/
+    ├── __init__.py     # from .plugin import MyPlugin;  __all__ = ["MyPlugin"]
+    └── plugin.py       # class MyPlugin(BasePlugin): ...
+```
+
+A `src/` layout works too: when the source root holds no importable name, discovery looks
+inside `src/`. Discovery skips `tests/`, `docs/`, `examples/`, and similar directories. If
+it finds zero or several plugin classes, the install fails and asks you to pass `--cls` —
+so `--cls` remains the override for multi-plugin repos and non-standard layouts.
+
+### Cache directory and manifest
+
+The cache is **per user, not per project**: a plugin is installed once and has to resolve
+from whatever directory you later launch training in. The location is the first of these
+that is set:
+
+1. the `--cache-dir` flag,
+2. the `AXOLOTL_PLUGIN_CACHE_DIR` environment variable,
+3. `$XDG_CACHE_HOME/axolotl/plugins`,
+4. `~/.cache/axolotl/plugins` (the default).
+
+Because config load reads the cache but takes no flags, installing with `--cache-dir`
+only helps if training sees the same directory — so the install prints a reminder to
+export `AXOLOTL_PLUGIN_CACHE_DIR` whenever you point it somewhere non-default. The cache
+directory writes its own `.gitignore`, so pointing it inside a repository does not dirty
+the checkout.
+
+Each install is recorded in `<cache_dir>/manifest.json`: the source, ref, resolved commit
+SHA, install mode, and the classes it provides. Config load reads it to resolve a bare
+`source:` and to restore `sys.path` for source-tree installs. Review what is installed
+with:
+
+```bash
+axolotl plugins list
+```
+
+A pip-installed plugin can also contribute its own `axolotl` subcommand — see
+[Adding a CLI command](#adding-a-cli-command) above.
+
+::: {.callout-warning}
+
+Loading a config never fetches or installs anything: axolotl runs no git, pip, or
+network at load time. It does `import` the declared plugin to verify it, so the plugin's
+own module code runs — the safety comes from installation being the explicit, trusted
+step, not from load being sandboxed.
+
+Installing is where trust is required — `axolotl plugins install` runs code from the
+source (its build backend, and an import of its modules to discover the plugin class).
+Only install plugins you trust, and pin `--ref` to a full commit SHA. Pinning is
+strongest for packages installed with pip (`--mode pip`), which snapshot the commit into
+your environment. A source loaded from its tree (`--mode syspath`, and any local path) is
+re-read from that directory on every run, so a `ref:` in the config records provenance
+but does **not** freeze the code — if the checkout changes underneath you, config load
+warns that what is installed no longer matches the pin. Only the plugin and its
+dependencies are installed; the Axolotl install itself is never modified.
+
+:::

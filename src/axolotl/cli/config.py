@@ -13,6 +13,7 @@ import torch
 import yaml
 from transformers.utils import is_torch_bf16_gpu_available, is_torch_tf32_available
 
+from axolotl.integrations.base import PluginManager
 from axolotl.telemetry.errors import send_errors
 from axolotl.telemetry.manager import TelemetryManager
 from axolotl.utils.comet_ import setup_comet_env_vars
@@ -217,7 +218,7 @@ def prepare_plugins(cfg: DictDefault):
 
 
 def plugin_set_cfg(cfg: DictDefault):
-    from axolotl.integrations.base import PluginManager, get_builtin_plugins
+    from axolotl.integrations.base import get_builtin_plugins
 
     if cfg.get("plugins") or get_builtin_plugins():
         PluginManager.get_instance().cfg = cfg

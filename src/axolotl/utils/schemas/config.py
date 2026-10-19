@@ -82,6 +82,68 @@ from axolotl.utils.schemas.vllm import VllmConfig
 LOG = get_logger(__name__)
 
 
+_PLUGIN_INSTALL_ONLY_KEYS = {
+    "pip_install": "`axolotl plugins install --mode pip`",
+    "update": "`axolotl plugins install --update`",
+}
+
+
+class PluginSpec(BaseModel):
+    """Reference to an externally installed plugin, recording where it came from.
+
+    Loading a config only verifies that the class is importable; install it first
+    with `axolotl plugins install <source>`.
+    """
+
+    # A typo'd key (`sourc:`) would otherwise be dropped and reported later as a
+    # missing `source:` the user believes they wrote.
+    model_config = {"extra": "forbid"}
+
+    cls: str | list[str] | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Dotted path(s) to the plugin class(es): a string, or a list to load several classes from one `source`. Optional when `source` is given and the plugin was installed with `axolotl plugins install`, which records the classes it provides."
+        },
+    )
+    source: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Git URL or local path the plugin was installed from. Documents provenance and tells the loader which install command to suggest; it is never fetched at config load."
+        },
+    )
+    ref: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Git branch, tag, or commit the plugin was installed at (a commit SHA is recommended for reproducibility)."
+        },
+    )
+    subdir: str | None = Field(
+        default=None,
+        json_schema_extra={
+            "description": "Subdirectory within the source that holds the plugin package."
+        },
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_install_only_keys(cls, data):
+        if not isinstance(data, dict):
+            return data
+        for key, replacement in _PLUGIN_INSTALL_ONLY_KEYS.items():
+            if key in data:
+                raise ValueError(
+                    f"`{key}` is no longer a config option: configs never install "
+                    f"plugins. Install the plugin with {replacement} instead."
+                )
+        return data
+
+    @model_validator(mode="after")
+    def _require_cls_or_source(self):
+        if not self.cls and not self.source:
+            raise ValueError("plugin entry needs at least one of `cls` or `source`")
+        return self
+
+
 class EBFTConfig(BaseModel):
     """Configuration for Energy-Based Fine-Tuning (EBFT)"""
 
@@ -1569,10 +1631,10 @@ class AxolotlInputConfig(
         },
     )
 
-    plugins: list[str] | None = Field(
+    plugins: list[str | PluginSpec] | None = Field(
         default=None,
         json_schema_extra={
-            "description": "Add plugins to extend the pipeline. See `src/axolotl/integrations` for the available plugins or doc below for more details. https://docs.axolotl.ai/docs/custom_integrations.html"
+            "description": "Add plugins to extend the pipeline. Each entry is either a dotted class path or a mapping referencing an externally installed plugin (`cls` plus the `source`/`ref` it was installed from). External plugins must be installed first with `axolotl plugins install`. See `src/axolotl/integrations` or https://docs.axolotl.ai/docs/custom_integrations.html"
         },
     )
     generate_samples: bool | None = Field(

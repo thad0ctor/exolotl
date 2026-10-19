@@ -3374,7 +3374,7 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         ("--plugins",),
         None,
         None,
-        "Add plugins to extend the pipeline. See `src/axolotl/integrations` for the available plugins or doc below for more details. https://docs.axolotl.ai/docs/custom_integrations.html",
+        "Add plugins to extend the pipeline. Each entry is either a dotted class path or a mapping referencing an externally installed plugin (`cls` plus the `source`/`ref` it was installed from). External plugins must be installed first with `axolotl plugins install`. See `src/axolotl/integrations` or https://docs.axolotl.ai/docs/custom_integrations.html",
     ),
     (
         ("--generate-samples/--no-generate-samples",),

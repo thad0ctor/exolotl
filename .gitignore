@@ -1,4 +1,5 @@
 **/axolotl.egg-info
+.axolotl_plugins/
 configs
 last_run_prepared/
 outputs
