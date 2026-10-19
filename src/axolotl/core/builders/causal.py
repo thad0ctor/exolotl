@@ -83,9 +83,26 @@ def _warn_if_num_workers_zero_for_mm(cfg, log, check_train_on_inputs=True) -> No
 
 
 def _is_multimodal_cpt(cfg) -> bool:
-    if not getattr(cfg, "pretraining_dataset", None):
-        return False
-    return is_mm_cpt_entry(cfg.pretraining_dataset[0])
+    return _get_mm_cpt_config(cfg) is not None
+
+
+def _entry_is_multimodal_cpt(entry) -> bool:
+    return is_mm_cpt_entry(entry)
+
+
+def _get_mm_cpt_config(cfg, is_eval: bool = False):
+    if is_eval and getattr(cfg, "test_datasets", None):
+        for entry in cfg.test_datasets:
+            if _entry_is_multimodal_cpt(entry):
+                return entry
+    for collection_name in ("pretraining_dataset", "datasets"):
+        collection = getattr(cfg, collection_name, None)
+        if not collection:
+            continue
+        for entry in collection:
+            if _entry_is_multimodal_cpt(entry):
+                return entry
+    return None
 
 
 def _mm_cpt_get(pt_cfg, key, default=None):
@@ -516,12 +533,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             build_image_token_spec,
         )
 
-        if is_eval and self.cfg.test_datasets:
-            pt_cfg = self.cfg.test_datasets[0]
-        elif self.cfg.pretraining_dataset:
-            pt_cfg = self.cfg.pretraining_dataset[0]
-        else:
-            pt_cfg = {}
+        pt_cfg = _get_mm_cpt_config(self.cfg, is_eval=is_eval) or {}
         spec = build_image_token_spec(
             self.processor, override=_mm_cpt_get(pt_cfg, "image_token")
         )
