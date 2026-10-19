@@ -2210,9 +2210,10 @@ class PretrainingValidationMixin:
                 "`pretraining_dataset` with `streaming: true`."
             )
 
-        if not first.get("path"):
+        mm_entry = pd_list[0] if pd_is_mm else datasets_list[0]
+        if isinstance(mm_entry, dict) and not mm_entry.get("path"):
             raise ValueError(
-                "Multimodal CPT `pretraining_dataset` entry requires `path` "
+                "Multimodal CPT dataset entry requires `path` "
                 "(a local file/glob or Hub repo). Without it loading fails "
                 "late with an unhelpful traceback."
             )
