@@ -441,12 +441,14 @@ tight `(image, target_text)` pair and any user/assistant framing would pollute
 the learned signal.
 
 ::: {.callout-note}
-**Currently supported via the streaming `pretraining_dataset` route only.**
-A non-streaming `datasets:` route (`type: multimodal_pretrain` under
-`datasets:`) is intentionally not wired — the collator selection inside
-`build_collator` only routes MM CPT batches under the pretraining branch.
-Configure MM CPT under `pretraining_dataset:` with `streaming: true` as
-shown below.
+MM CPT supports two raw image+text routes:
+
+- `pretraining_dataset:` with `streaming: true` for iterable streaming.
+- `datasets:` with `type: multimodal_pretrain` for the standard non-streaming
+  prepared dataset pipeline.
+
+The non-streaming path stores token metadata plus image paths in the prepared
+dataset; decoded image tensors are loaded by the collator at batch time.
 :::
 
 ### Dataset format (JSONL)
@@ -508,6 +510,59 @@ max_steps: 10000
 micro_batch_size: 1
 gradient_accumulation_steps: 8
 ```
+
+For large streaming runs that need cheap checkpoint resume, set
+`dataset_prepared_path` so Axolotl can cache the tokenized MM CPT rows, and use
+`ignore_data_skip: true` when you prefer resuming optimizer/scheduler state
+without Trainer fast-forwarding through already-seen multimodal batches:
+
+```yaml
+pretraining_dataset:
+  - path: /path/to/shards/*.jsonl
+    ds_type: json
+    type: multimodal_pretrain
+    text_column: text
+    image_column: images
+
+streaming: true
+dataset_prepared_path: ./data/mm-cpt-stream-cache
+ignore_data_skip: true
+max_steps: 10000
+```
+
+### Non-streaming prepared YAML example
+
+```yaml
+base_model: HuggingFaceTB/SmolVLM-500M-Instruct
+processor_type: AutoProcessor
+
+datasets:
+  - path: /path/to/train.jsonl
+    ds_type: json
+    type: multimodal_pretrain
+    text_column: text
+    image_column: images
+    image_base_dir: /path/to/images   # optional, for relative paths
+    # image_token: "<image>"           # optional override; autodetect by default
+    # skip_bad_images: false           # drop malformed/unloadable rows instead of aborting
+    # allow_remote_images: false       # permit http(s)/URL image sources (off = SSRF-safe)
+
+streaming: false
+dataset_prepared_path: ./data/prepared
+sequence_len: 2048
+sample_packing: false                  # REQUIRED — see below
+remove_unused_columns: false           # auto-set by validator
+
+num_epochs: 1                           # max_steps is optional in this path
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+```
+
+Because this route creates a map-style dataset with a known length, Axolotl can
+infer scheduler/training steps from `num_epochs`; unlike streaming
+`pretraining_dataset`, you do not need to manually calculate `max_steps`. You
+can run `axolotl preprocess` on this mode; the prepared Arrow dataset keeps
+`images` as image references and `_mm_text` as raw text for the collator.
 
 ### Eval datasets
 

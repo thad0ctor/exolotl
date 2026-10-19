@@ -689,6 +689,45 @@ def generate_dataset_hash_from_config(
     return str(md5(config_str))
 
 
+def generate_pretraining_dataset_hash(
+    cfg: DictDefault,
+    pretraining_config: DictDefault,
+    tokenizer_name: str,
+    processor_name: str | None,
+) -> str:
+    """Hash that pins the prepared mm-pretraining cache to the inputs that produced it."""
+    if cfg.get("added_tokens_overrides"):
+        tokenizer_fingerprint = f"{cfg.tokenizer_config}+overrides:" + ",".join(
+            f"{k}={v}" for k, v in sorted(cfg.added_tokens_overrides.items())
+        )
+    else:
+        tokenizer_fingerprint = tokenizer_name
+
+    # image_base_dir is consumed by the collator at runtime, not by the encoder, so it does not bind cached arrows.
+    keys = (
+        "path",
+        "name",
+        "split",
+        "data_files",
+        "ds_type",
+        "type",
+        "text_column",
+        "image_column",
+        "image_token",
+        "multimodal",
+        "skip",
+        "skip_bad_images",
+    )
+    ds_fingerprint = "|".join(f"{k}={pretraining_config.get(k)!r}" for k in keys)
+    config_str = (
+        f"pretrain@{cfg.sequence_len}|"
+        f"{ds_fingerprint}|"
+        f"{tokenizer_fingerprint}|"
+        f"processor={processor_name or 'None'}"
+    )
+    return str(md5(config_str))
+
+
 def merge_datasets(datasets: list[Dataset], cfg: DictDefault) -> Dataset:
     """Merge multiple datasets into one with optional shuffling.
 

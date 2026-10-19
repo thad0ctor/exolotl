@@ -301,6 +301,7 @@ def wrap_streaming_dataset(
     processor: Optional[ProcessorMixin] = None,
     pretraining_config=None,
     is_eval: bool = False,
+    cache_prep: bool = False,
 ):
     # Eval streams honor cfg.eval_sequence_len when set, else cfg.sequence_len.
     effective_seq_len = (
@@ -309,6 +310,11 @@ def wrap_streaming_dataset(
         else cfg.sequence_len
     )
     if cfg.sample_packing:
+        # cache_prep mutates micro_batch_size via the packing branch; mm-CPT forbids packing so this should be unreachable.
+        if cache_prep:
+            raise ValueError(
+                "wrap_streaming_dataset cache_prep=True is incompatible with sample_packing"
+            )
         # For SFT (non-pretraining) datasets, always use multipack_attn=True to ensure
         # attention isolation between packed sequences
         multipack_attn = (
@@ -403,7 +409,8 @@ def wrap_streaming_dataset(
                 concatenate=cfg.pretraining_sample_concatenation is True,
             )
 
-    if cfg.shuffle_merged_datasets:
+    # cache_prep: DataLoader will reshuffle the resulting map-style dataset each epoch.
+    if cfg.shuffle_merged_datasets and not cache_prep:
         dataset = dataset.shuffle(
             seed=cfg.seed, buffer_size=cfg.streaming_multipack_buffer_size
         )
@@ -421,12 +428,16 @@ def wrap_streaming_dataset(
     else:
         remove_columns = list(dataset.features.keys())
 
-    dataset = dataset.map(
-        encode,
-        batched=True,
-        batch_size=cfg.streaming_multipack_buffer_size,
-        remove_columns=remove_columns,
-    )
+    map_kwargs = {
+        "batched": True,
+        "batch_size": cfg.streaming_multipack_buffer_size,
+        "remove_columns": remove_columns,
+    }
+    # Only the cache_prep path is a materialized Dataset; IterableDataset.map()
+    # rejects num_proc entirely (even num_proc=None), so don't pass it there.
+    if cache_prep:
+        map_kwargs["num_proc"] = cfg.dataset_num_proc
+    dataset = dataset.map(encode, **map_kwargs)
     return dataset
 
 

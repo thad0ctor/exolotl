@@ -1,27 +1,213 @@
 """Multimodal CPT helpers (image-token autodetection + processor compat).
 
-Only the streaming `pretraining_dataset` route is wired in v1; the
-non-streaming `datasets:` route (strategy class + `load()`) is deferred to a
-follow-on PR that also wires `build_collator` to route MM CPT batches outside
-the `training_args.pretraining` branch.
+Supports both the streaming `pretraining_dataset` route and the non-streaming
+`datasets:` route (strategy class + `load()`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Optional
 
-from transformers import ProcessorMixin
+from datasets import Dataset, IterableDataset
+from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
+from axolotl.prompt_tokenizers import DatasetWrappingStrategy
 from axolotl.utils.logging import get_logger
 
 LOG = get_logger(__name__)
 
 
-def load(*_args, **_kwargs):
-    raise ValueError(
-        "multimodal_pretrain is only supported via pretraining_dataset "
-        "with streaming: true — see docs/multimodal.qmd"
+class MultiModalPretrainDatasetWrappingStrategy(DatasetWrappingStrategy):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        processor: ProcessorMixin,
+        sequence_len: int,
+        text_column: str = "text",
+        image_column: str = "images",
+        image_token: str | None = None,
+        skip_bad_images: bool = False,
+    ):
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.sequence_len = sequence_len
+        self.text_column = text_column
+        self.image_column = image_column
+        self.skip_bad_images = skip_bad_images
+        self.image_token_spec = build_image_token_spec(processor, override=image_token)
+
+    def _encode_batch(self, examples: dict[str, list]) -> dict[str, list]:
+        return encode_multimodal_pretrain(
+            examples,
+            tokenizer=self.tokenizer,
+            max_tokens=self.sequence_len,
+            image_token=self.image_token_spec.image_token,
+            image_token_id=self.image_token_spec.image_token_id,
+            text_column=self.text_column,
+            image_column=self.image_column,
+            enforce_max_length=False,
+            skip_bad_rows=self.skip_bad_images,
+        )
+
+    def wrap_dataset(
+        self,
+        dataset,
+        process_count: int | None = None,
+        keep_in_memory: bool | None = False,
+        **kwargs,
+    ) -> Dataset | IterableDataset:
+        if isinstance(dataset, Dataset):
+            remove_columns = list(dataset.column_names)
+        elif getattr(dataset, "features", None):
+            remove_columns = list(dataset.features.keys())
+        else:
+            remove_columns = None
+
+        map_kwargs: dict[str, Any] = {
+            "batched": True,
+            "remove_columns": remove_columns,
+            "desc": "Tokenizing multimodal CPT dataset",
+        }
+        if isinstance(dataset, Dataset):
+            if process_count:
+                map_kwargs["num_proc"] = process_count
+            if keep_in_memory is not None:
+                map_kwargs["keep_in_memory"] = keep_in_memory
+
+        return dataset.map(self._encode_batch, **map_kwargs)
+
+
+def load(
+    tokenizer,
+    cfg,
+    ds_cfg: Optional[dict[str, Any]] = None,
+    processor: ProcessorMixin | None = None,
+):
+    ds_cfg = ds_cfg or {}
+    if processor is None:
+        raise ValueError(
+            "Multimodal CPT (type: multimodal_pretrain) requires a processor. "
+            "Set `processor_type: AutoProcessor` (or the concrete processor "
+            "class) in your config."
+        )
+    check_processor_compatibility(processor)
+    processor_tokenizer = getattr(processor, "tokenizer", None)
+    if processor_tokenizer is not None and processor_tokenizer is not tokenizer:
+        raise ValueError(
+            "Multimodal CPT requires `tokenizer` to be `processor.tokenizer` "
+            "so image placeholder ids stay aligned during encoding."
+        )
+
+    text_column = ds_cfg.get("text_column") or "text"
+    image_column = ds_cfg.get("image_column") or "images"
+    LOG.info(
+        "multimodal CPT dataset path: text_column=%r image_column=%r",
+        text_column,
+        image_column,
     )
+    return MultiModalPretrainDatasetWrappingStrategy(
+        tokenizer=tokenizer,
+        processor=processor,
+        sequence_len=cfg.sequence_len,
+        text_column=text_column,
+        image_column=image_column,
+        image_token=ds_cfg.get("image_token"),
+        skip_bad_images=bool(ds_cfg.get("skip_bad_images", False)),
+    )
+
+
+def encode_multimodal_pretrain(
+    examples: dict[str, list],
+    tokenizer: PreTrainedTokenizerBase,
+    max_tokens: int,
+    image_token: str,
+    image_token_id: int,
+    text_column: str = "text",
+    image_column: str = "images",
+    enforce_max_length: bool = True,
+    skip_bad_rows: bool = False,
+) -> dict[str, list]:
+    texts: list[str] = examples[text_column]
+    imgs_list: list[list[str]] = examples[image_column]
+
+    if len(texts) != len(imgs_list):
+        raise ValueError(
+            f"encode_multimodal_pretrain: text column has {len(texts)} rows "
+            f"but image column has {len(imgs_list)}"
+        )
+
+    input_ids: list[list[int]] = []
+    labels: list[list[int]] = []
+    attention_mask: list[list[int]] = []
+    keep_images: list[list[str]] = []
+    keep_text: list[str] = []
+
+    for text, imgs in zip(texts, imgs_list, strict=True):
+        if not isinstance(text, str):
+            raise TypeError(
+                f"encode_multimodal_pretrain: `{text_column}` must be str, "
+                f"got {type(text).__name__}."
+            )
+        if imgs is None:
+            imgs = []
+        if not isinstance(imgs, (list, tuple)):
+            raise ValueError(
+                f"encode_multimodal_pretrain: row's `{image_column}` must be "
+                f"a list; got {type(imgs).__name__}"
+            )
+        for j, ip in enumerate(imgs):
+            if not isinstance(ip, str):
+                raise TypeError(
+                    f"encode_multimodal_pretrain: image {j} in row must be "
+                    f"str, got {type(ip).__name__}."
+                )
+        # Avoid truncation before processor re-tokenization.
+        enc = tokenizer(text, add_special_tokens=True)
+        ids = list(enc["input_ids"])
+        mask = list(enc["attention_mask"])
+        # Append EOS only if the tokenizer didn't (avoid double EOS) and it exists (avoid a None id).
+        eos_id = tokenizer.eos_token_id
+        if eos_id is not None and (not ids or ids[-1] != eos_id):
+            ids.append(eos_id)
+            mask.append(1)
+        # Count by id; text.count can match <image> inside <image_soft_token>.
+        n_placeholders = sum(1 for t in ids if t == image_token_id)
+        if n_placeholders != len(imgs):
+            msg = (
+                f"Multimodal CPT row has {n_placeholders} occurrence(s) of "
+                f"{image_token!r} in text but {len(imgs)} image path(s). "
+                f"Text and image count must match (one placeholder per image)."
+            )
+            if skip_bad_rows:
+                LOG.warning("%s — dropping row.", msg)
+                continue
+            raise ValueError(msg)
+        if enforce_max_length and len(ids) > max_tokens:
+            msg = (
+                f"Multimodal CPT row tokenizes to {len(ids)} tokens which "
+                f"exceeds sequence_len={max_tokens}. Pre-chunk your text or "
+                f"raise sequence_len (image patch expansion at the processor "
+                f"may push the final length even higher)."
+            )
+            if skip_bad_rows:
+                LOG.warning("%s — dropping row.", msg)
+                continue
+            raise ValueError(msg)
+        # Labels = ids; collator masks image-family ids after re-tokenization.
+        input_ids.append(ids)
+        labels.append(list(ids))
+        attention_mask.append(mask)
+        keep_images.append(list(imgs))
+        keep_text.append(text)
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "images": keep_images,
+        "_mm_text": keep_text,
+    }
 
 
 def _get_incompatible_processor_classes() -> tuple[type, ...]:

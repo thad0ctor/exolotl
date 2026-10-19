@@ -2,11 +2,99 @@
 
 from __future__ import annotations
 
+from datasets import Dataset
+
 from axolotl.utils.data.sft import (
     _create_placeholder_dataset,
+    _load_and_process_single_dataset,
+    _prepare_standard_dataset,
     _prepare_streaming_dataset,
 )
 from axolotl.utils.dict import DictDefault
+
+
+class _Tokenizer:
+    name_or_path = "tok"
+
+
+def test_nonstreaming_pretokenized_mm_rows_keep_collator_columns(monkeypatch):
+    dataset = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3]],
+            "attention_mask": [[1, 1, 1]],
+            "labels": [[1, 2, 3]],
+            "_mm_text": ["<image>\nrow"],
+            "images": [["rel/a.png"]],
+        }
+    )
+    monkeypatch.setattr(
+        "axolotl.utils.data.sft.load_dataset_with_config",
+        lambda *_args, **_kwargs: dataset,
+    )
+    cfg = DictDefault(
+        {
+            "hf_use_auth_token": None,
+            "dataset_num_proc": None,
+            "dataset_keep_in_memory": False,
+            "skip_prepare_dataset": False,
+        }
+    )
+    entry = DictDefault(
+        {"path": "json", "type": "multimodal_pretrain", "split": "train"}
+    )
+
+    wrapped, _ = _load_and_process_single_dataset(
+        entry,
+        cfg,
+        _Tokenizer(),
+        split="train",
+        seed=42,
+    )
+
+    assert wrapped.column_names == dataset.column_names
+    assert wrapped[0]["_mm_text"] == "<image>\nrow"
+    assert wrapped[0]["images"] == ["rel/a.png"]
+
+
+def test_standard_mm_datasets_num_epochs_derives_total_steps(monkeypatch, tmp_path):
+    train_dataset = Dataset.from_dict(
+        {
+            "input_ids": [[1], [1, 2], [1, 2, 3], [1], [1, 2]],
+            "attention_mask": [[1], [1, 1], [1, 1, 1], [1], [1, 1]],
+            "labels": [[1], [1, 2], [1, 2, 3], [1], [1, 2]],
+        }
+    )
+
+    def fake_load_and_prepare(*_args, **_kwargs):
+        return train_dataset, None, [None]
+
+    monkeypatch.setattr(
+        "axolotl.utils.data.sft._load_and_prepare_datasets",
+        fake_load_and_prepare,
+    )
+    cfg = DictDefault(
+        {
+            "dataset_prepared_path": str(tmp_path),
+            "datasets": [{"path": "json", "type": "multimodal_pretrain"}],
+            "test_datasets": None,
+            "val_set_size": 0,
+            "sample_packing": False,
+            "eval_sample_packing": False,
+            "max_steps": None,
+            "num_epochs": 2,
+            "batch_size": 4,
+            "skip_prepare_dataset": False,
+            "reward_model": False,
+            "total_num_tokens": None,
+            "total_supervised_tokens": None,
+            "model_config_type": None,
+        }
+    )
+
+    _, _, total_steps, _ = _prepare_standard_dataset(cfg, _Tokenizer(), None)
+
+    assert total_steps == 3
+
 
 # ---- placeholder dataset for dispatch_batches ----------------------------
 
@@ -296,62 +384,6 @@ def test_eval_collator_uses_eval_image_settings(monkeypatch):
     assert captured["kwargs"]["image_base_dir"] == "/train_images"
 
 
-def test_collator_forwards_skip_and_remote_flags(monkeypatch):
-    """`skip_bad_images` / `allow_remote_images` on the dataset entry reach the collator."""
-    from axolotl.core.builders.causal import HFCausalTrainerBuilder
-
-    captured = {}
-
-    class _FakeSpec:
-        image_token = "<img>"
-        image_token_id = 7
-        image_family_token_ids = (7,)
-
-    monkeypatch.setattr(
-        "axolotl.prompt_strategies.multimodal_pretrain.build_image_token_spec",
-        lambda processor, override=None: _FakeSpec(),
-    )
-
-    class _FakeCollator:
-        def __init__(self, **kw):
-            captured["kwargs"] = kw
-
-    monkeypatch.setattr(
-        "axolotl.core.builders.causal.MultiModalPretrainDataCollator", _FakeCollator
-    )
-
-    builder = HFCausalTrainerBuilder.__new__(HFCausalTrainerBuilder)
-    builder.tokenizer = object()
-    builder.processor = object()
-    builder.cfg = DictDefault(
-        {
-            "pretraining_dataset": [
-                {
-                    "type": "multimodal_pretrain",
-                    "skip_bad_images": True,
-                    "allow_remote_images": True,
-                }
-            ],
-            "sequence_len": 2048,
-        }
-    )
-    builder._build_mm_pretrain_collator(is_eval=False)
-    assert captured["kwargs"]["skip_bad_images"] is True
-    assert captured["kwargs"]["allow_remote_images"] is True
-
-    # Unset -> secure defaults (False), never None.
-    captured.clear()
-    builder.cfg = DictDefault(
-        {
-            "pretraining_dataset": [{"type": "multimodal_pretrain"}],
-            "sequence_len": 2048,
-        }
-    )
-    builder._build_mm_pretrain_collator(is_eval=False)
-    assert captured["kwargs"]["skip_bad_images"] is False
-    assert captured["kwargs"]["allow_remote_images"] is False
-
-
 def test_eval_collator_honors_eval_sequence_len(monkeypatch):
     """Eval collator uses cfg.eval_sequence_len when set; train collator uses cfg.sequence_len."""
     from axolotl.core.builders.causal import HFCausalTrainerBuilder
@@ -406,3 +438,59 @@ def test_eval_collator_honors_eval_sequence_len(monkeypatch):
     captured.clear()
     builder._build_mm_pretrain_collator(is_eval=True)
     assert captured["kwargs"]["max_length"] == 4096
+
+
+def test_collator_forwards_skip_and_remote_flags(monkeypatch):
+    """`skip_bad_images` / `allow_remote_images` on the dataset entry reach the collator."""
+    from axolotl.core.builders.causal import HFCausalTrainerBuilder
+
+    captured = {}
+
+    class _FakeSpec:
+        image_token = "<img>"
+        image_token_id = 7
+        image_family_token_ids = (7,)
+
+    monkeypatch.setattr(
+        "axolotl.prompt_strategies.multimodal_pretrain.build_image_token_spec",
+        lambda processor, override=None: _FakeSpec(),
+    )
+
+    class _FakeCollator:
+        def __init__(self, **kw):
+            captured["kwargs"] = kw
+
+    monkeypatch.setattr(
+        "axolotl.core.builders.causal.MultiModalPretrainDataCollator", _FakeCollator
+    )
+
+    builder = HFCausalTrainerBuilder.__new__(HFCausalTrainerBuilder)
+    builder.tokenizer = object()
+    builder.processor = object()
+    builder.cfg = DictDefault(
+        {
+            "pretraining_dataset": [
+                {
+                    "type": "multimodal_pretrain",
+                    "skip_bad_images": True,
+                    "allow_remote_images": True,
+                }
+            ],
+            "sequence_len": 2048,
+        }
+    )
+    builder._build_mm_pretrain_collator(is_eval=False)
+    assert captured["kwargs"]["skip_bad_images"] is True
+    assert captured["kwargs"]["allow_remote_images"] is True
+
+    # Unset -> secure defaults (False), never None.
+    captured.clear()
+    builder.cfg = DictDefault(
+        {
+            "pretraining_dataset": [{"type": "multimodal_pretrain"}],
+            "sequence_len": 2048,
+        }
+    )
+    builder._build_mm_pretrain_collator(is_eval=False)
+    assert captured["kwargs"]["skip_bad_images"] is False
+    assert captured["kwargs"]["allow_remote_images"] is False
