@@ -45,8 +45,7 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.skipif(
         not (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_capability() >= (10, 0)
+            torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
         ),
         reason="native NVFP4 attention requires sm>=100 (Blackwell)",
     ),
@@ -246,9 +245,7 @@ def test_packed_routing_cu_seqlens_reaches_kernel(monkeypatch):
     """Packed batch -> kernel gets cu_seqlens; dense batch -> dense path
     unchanged (no cu_seqlens); multi-row pack -> original forward (no kernel)."""
     attn, rot, cfg = _build_attn(seed=3)
-    patch_qwen3_5_nvfp4_attention(
-        attn, train_backward=True, packed_min_sample_len=0
-    )
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True, packed_min_sample_len=0)
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=3)
 
     calls = []
@@ -278,9 +275,9 @@ def test_packed_routing_cu_seqlens_reaches_kernel(monkeypatch):
     hs2 = torch.randn(
         2, 128, cfg.hidden_size, device="cuda", dtype=torch.bfloat16
     ).requires_grad_(True)
-    pos_multi = torch.cat(
-        [torch.arange(64), torch.arange(64)]
-    ).unsqueeze(0).repeat(2, 1).cuda()
+    pos_multi = (
+        torch.cat([torch.arange(64), torch.arange(64)]).unsqueeze(0).repeat(2, 1).cuda()
+    )
     out2, _ = attn(
         hidden_states=hs2,
         position_embeddings=_cos_sin(rot, hs2, pos_multi),
@@ -329,9 +326,7 @@ def test_packed_default_auto_short_mean_uses_hp_backward(monkeypatch):
     import sageattention.nvfp4.flash as sage_flash
 
     attn, rot, cfg = _build_attn(seed=11)
-    patch_qwen3_5_nvfp4_attention(
-        attn, train_backward=True, packed_min_sample_len=0
-    )
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True, packed_min_sample_len=0)
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=11)
 
     hp_calls = []
@@ -419,9 +414,7 @@ def test_packed_32k_mean_auto_routes_fp4_rownorm_parity(monkeypatch):
         attn, orig_forward, rot, hs0, w, lens=lens
     )
 
-    patch_qwen3_5_nvfp4_attention(
-        attn, train_backward=True, packed_min_sample_len=0
-    )
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True, packed_min_sample_len=0)
     bwd_modes = []
     real_bwd = sage_flash._run_bwd
 
@@ -434,8 +427,7 @@ def test_packed_32k_mean_auto_routes_fp4_rownorm_parity(monkeypatch):
     out, grad = _run_patched(attn, rot, hs0, pos, w)
     assert torch.isfinite(out).all() and torch.isfinite(grad).all()
     assert bwd_modes == ["fp4_rownorm"], (
-        "kernel AUTO at mean 32768 must resolve to fp4_rownorm, got "
-        f"{bwd_modes}"
+        f"kernel AUTO at mean 32768 must resolve to fp4_rownorm, got {bwd_modes}"
     )
     cf, cg = _cos(out, ref_out), _cos(grad, ref_grad)
     assert cf > FWD_COS, f"32k-mean packed fwd cos={cf:.4f} <= {FWD_COS}"
@@ -552,9 +544,7 @@ def test_packed_gate_positive_routes_short_packs_to_original(monkeypatch, caplog
     use the ORIGINAL forward (no FP4 entrypoint) with a one-time INFO stating
     the resolution and the measured mean."""
     attn, rot, cfg = _build_attn(seed=6)
-    patch_qwen3_5_nvfp4_attention(
-        attn, train_backward=True, packed_min_sample_len=1024
-    )
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True, packed_min_sample_len=1024)
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=6)
     calls = _spy_fp4_entrypoints(monkeypatch)
 
@@ -610,9 +600,7 @@ def test_packed_gate_decision_cached_once_per_step(monkeypatch):
     ONCE per distinct position_ids tensor — repeated layer calls within a step
     reuse the cache; a new step's tensor recomputes."""
     attn, rot, cfg = _build_attn(seed=8)
-    patch_qwen3_5_nvfp4_attention(
-        attn, train_backward=True, packed_min_sample_len=0
-    )
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True, packed_min_sample_len=0)
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=8)
 
     n = {"compute": 0}
@@ -658,9 +646,7 @@ def test_packed_nograd_uses_fused_packed_forward(monkeypatch):
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=9)
     ref_out, _ = _per_sample_reference(attn, orig_forward, rot, hs0, w)
 
-    patch_qwen3_5_nvfp4_attention(
-        attn, train_backward=True, packed_min_sample_len=0
-    )
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True, packed_min_sample_len=0)
     packed_calls = []
     real_packed = patch_mod.nvfp4_flash_attention_packed
 
@@ -699,9 +685,7 @@ def test_packed_grad_uses_prepacked_qk(monkeypatch):
     import sageattention.nvfp4.flash as sage_flash
 
     attn, rot, cfg = _build_attn(seed=10)
-    patch_qwen3_5_nvfp4_attention(
-        attn, train_backward=True, packed_min_sample_len=0
-    )
+    patch_qwen3_5_nvfp4_attention(attn, train_backward=True, packed_min_sample_len=0)
     hs0, pos, w = _packed_inputs(cfg.hidden_size, seed=10)
 
     seen = []
@@ -755,19 +739,34 @@ def test_custom_op_wrapper_rejects_invalid_combos():
         )
     with pytest.raises(ValueError, match="causal"):
         nvfp4_flash_attn_train_custom_op(
-            q, k, v, D**-0.5, causal=False,
-            num_key_value_groups=HEADS // KV, cu_seqlens=cu,
+            q,
+            k,
+            v,
+            D**-0.5,
+            causal=False,
+            num_key_value_groups=HEADS // KV,
+            cu_seqlens=cu,
         )
     dense = dict(causal=True, num_key_value_groups=HEADS // KV)
     with pytest.raises(ValueError, match="fp8_rownorm"):
         nvfp4_flash_attn_train_custom_op(
-            q, k, v, D**-0.5, **dense,
-            backward_grad_dots="fp8_rownorm", save_backward_packs=True,
+            q,
+            k,
+            v,
+            D**-0.5,
+            **dense,
+            backward_grad_dots="fp8_rownorm",
+            save_backward_packs=True,
         )
     with pytest.raises(ValueError, match="not both"):
         nvfp4_flash_attn_train_custom_op(
-            q, k, v, D**-0.5, **dense,
-            backward_grad_dots="bf16", backward_bf16_grad_dots=True,
+            q,
+            k,
+            v,
+            D**-0.5,
+            **dense,
+            backward_grad_dots="bf16",
+            backward_bf16_grad_dots=True,
         )
     with pytest.raises(ValueError, match="must be one of"):
         nvfp4_flash_attn_train_custom_op(

@@ -269,7 +269,11 @@ def _scaled_lse(
     device = hidden.device
     running_max = torch.full((M,), float("-inf"), device=device, dtype=torch.float32)
     running_sum = torch.zeros(M, device=device, dtype=torch.float32)
-    hb = None if (res_A is None or not is_store) else (hidden.to(res_B.dtype) @ res_B.t())
+    hb = (
+        None
+        if (res_A is None or not is_store)
+        else (hidden.to(res_B.dtype) @ res_B.t())
+    )
 
     ctx = torch.enable_grad() if grad else torch.no_grad()
     with ctx:
@@ -420,13 +424,26 @@ def lm_head_distillation_loss(
 
     if state.top_k is not None:
         kl = _kl_topk(
-            store, teacher_w, h2d, lse, tk_idx, state.temperature, state.vocab_block,
-            res_A=res_A, res_B=res_B,
+            store,
+            teacher_w,
+            h2d,
+            lse,
+            tk_idx,
+            state.temperature,
+            state.vocab_block,
+            res_A=res_A,
+            res_B=res_B,
         )
     else:
         kl = _kl_full(
-            store, teacher_w, h2d, lse, state.temperature, state.vocab_block,
-            res_A=res_A, res_B=res_B,
+            store,
+            teacher_w,
+            h2d,
+            lse,
+            state.temperature,
+            state.vocab_block,
+            res_A=res_A,
+            res_B=res_B,
         )
 
     state.last_kl = float(kl.detach())
@@ -485,9 +502,7 @@ def _student_ce_and_hidden(self, args, kwargs, labels, num_items_in_batch):
     loss_fn = getattr(self, "loss_function", None)
     vocab = logits.shape[-1]
     if loss_fn is not None:
-        ce = loss_fn(
-            logits, labels, vocab, num_items_in_batch=num_items_in_batch
-        )
+        ce = loss_fn(logits, labels, vocab, num_items_in_batch=num_items_in_batch)
     else:
         from transformers.loss.loss_utils import ForCausalLMLoss
 

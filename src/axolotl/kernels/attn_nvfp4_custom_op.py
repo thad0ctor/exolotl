@@ -285,14 +285,10 @@ def _flash_attention_train_op(
     # convention as key_pad_bias / cu_seqlens). They skip the matching forward
     # pre-quant only; backward still repacks from the saved hp q/k.
     q_packs = (
-        None
-        if qnv_in.numel() == 0
-        else (qnv_in, qsc_in.view(torch.float8_e4m3fn))
+        None if qnv_in.numel() == 0 else (qnv_in, qsc_in.view(torch.float8_e4m3fn))
     )
     k_packs = (
-        None
-        if knv_in.numel() == 0
-        else (knv_in, ksc_in.view(torch.float8_e4m3fn))
+        None if knv_in.numel() == 0 else (knv_in, ksc_in.view(torch.float8_e4m3fn))
     )
     # Varlen forces the HP backward, which is mutually exclusive with saved
     # packs — never produce packs for a varlen forward (mirrors the kernel).
@@ -927,11 +923,7 @@ def nvfp4_flash_attn_train_custom_op(
         if key_pad_bias is None
         else key_pad_bias
     )
-    cu = (
-        query.new_empty((0,), dtype=torch.int32)
-        if cu_seqlens is None
-        else cu_seqlens
-    )
+    cu = query.new_empty((0,), dtype=torch.int32) if cu_seqlens is None else cu_seqlens
     empty_u8 = query.new_empty((0,), dtype=torch.uint8)
     qnv_in, qsc_in = (
         (q_packs[0].view(torch.uint8), q_packs[1].view(torch.uint8))

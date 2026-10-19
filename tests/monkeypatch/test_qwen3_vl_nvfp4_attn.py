@@ -16,8 +16,7 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.skipif(
         not (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_capability() >= (10, 0)
+            torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
         ),
         reason="native NVFP4 attention requires sm>=100 (Blackwell)",
     ),

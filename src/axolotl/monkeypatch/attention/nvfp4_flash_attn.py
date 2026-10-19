@@ -89,8 +89,7 @@ try:
     import inspect as _inspect
 
     _PACKED_FWD_VARLEN = (
-        "cu_seqlens"
-        in _inspect.signature(nvfp4_flash_attention_packed).parameters
+        "cu_seqlens" in _inspect.signature(nvfp4_flash_attention_packed).parameters
     )
 except (TypeError, ValueError):  # pragma: no cover - exotic callables
     _PACKED_FWD_VARLEN = False
@@ -101,9 +100,7 @@ except (TypeError, ValueError):  # pragma: no cover - exotic callables
 # the forward packs), eliminating the HF rope round-trip plus the standalone
 # q/k forward pre-quant launches. Detected once at import.
 try:
-    _TRAIN_PREPACKED = (
-        "q_packs" in _inspect.signature(nvfp4_flash_attn_func).parameters
-    )
+    _TRAIN_PREPACKED = "q_packs" in _inspect.signature(nvfp4_flash_attn_func).parameters
 except (TypeError, ValueError):  # pragma: no cover - exotic callables
     _TRAIN_PREPACKED = False
 
@@ -226,8 +223,7 @@ def _resolve_grad_dots_alias(
     if bf16_grad_dots is not None:
         if grad_dots is not None:
             raise ValueError(
-                "pass either grad_dots or the deprecated bf16_grad_dots alias, "
-                "not both"
+                "pass either grad_dots or the deprecated bf16_grad_dots alias, not both"
             )
         grad_dots = "bf16" if bf16_grad_dots else "fp4_legacy"
     if grad_dots is not None and grad_dots not in _GRAD_DOTS_MODES:
@@ -898,9 +894,7 @@ def make_nvfp4_forward(orig_forward):
                 1, 2
             )
         else:
-            query_states = self.q_norm(query_states.view(hidden_shape)).transpose(
-                1, 2
-            )
+            query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
             key_states = self.k_norm(key_pre).transpose(1, 2)
 
         if kind == "packed":
@@ -1007,9 +1001,7 @@ def make_nvfp4_forward(orig_forward):
                 qnv_t, qsc_t, query_roped = fused_rope_quant_qk_hp(
                     query_states, cos, sin
                 )
-                knv_t, ksc_t, key_roped = fused_rope_quant_qk_hp(
-                    key_states, cos, sin
-                )
+                knv_t, ksc_t, key_roped = fused_rope_quant_qk_hp(key_states, cos, sin)
                 q_packs, k_packs = (qnv_t, qsc_t), (knv_t, ksc_t)
             else:
                 query_roped, key_roped = apply_rotary_pos_emb(
@@ -1074,9 +1066,7 @@ def make_nvfp4_forward(orig_forward):
                     cu_seqlens=cu_seqlens,
                     stochastic_rounding=sr,
                     save_backward_packs=False,
-                    dkdv_scratch_bf16=getattr(
-                        self, "_nvfp4_dkdv_scratch_bf16", False
-                    ),
+                    dkdv_scratch_bf16=getattr(self, "_nvfp4_dkdv_scratch_bf16", False),
                     **_grad_dots_kwargs(self),
                     **prepacked_kwargs,
                 )  # [Z, S, H, D] (zshd) or [Z, H, S, D] (legacy fork)

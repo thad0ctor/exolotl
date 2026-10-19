@@ -260,9 +260,7 @@ class TestNVFP4Training:
             xx = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
             out = mod(xx).detach().clone()
             # fresh module built from the CURRENT live weight = ground truth
-            fresh = NVFP4Linear(
-                nn.Parameter(mod.weight.detach().clone()), None, recipe
-            )
+            fresh = NVFP4Linear(nn.Parameter(mod.weight.detach().clone()), None, recipe)
             ref = fresh(xx).detach().clone()
             assert torch.equal(out, ref), (
                 f"stale forward at step {step}: cache not rebuilt for trainable "
@@ -1421,11 +1419,36 @@ class TestNVFP4BaseResidual:
             Xc = X.clone().requires_grad_(True)
             with torch.autocast("cuda", torch.bfloat16):
                 h = LoRA_MLP.apply(
-                    Xc, None,
-                    None, None, gate_m, gA, gB, 2.0, None, None,
-                    None, None, up_m, uA, uB, 2.0, None, None,
-                    None, None, down_m, dA, dB, 2.0, None, None,
-                    swiglu_forward, swiglu_backward, True, False,
+                    Xc,
+                    None,
+                    None,
+                    None,
+                    gate_m,
+                    gA,
+                    gB,
+                    2.0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    up_m,
+                    uA,
+                    uB,
+                    2.0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    down_m,
+                    dA,
+                    dB,
+                    2.0,
+                    None,
+                    None,
+                    swiglu_forward,
+                    swiglu_backward,
+                    True,
+                    False,
                 )
                 out = LoRA_O.apply(h, None, None, None, o_m, oA, oB, 2.0, None, None)
             (out.float().square().mean() * 100).backward()
@@ -1505,18 +1528,41 @@ class TestNVFP4BaseResidual:
                 for o in (256, 128, 128)
             ]
 
-            def run_qkv():
-                As = [A.clone().requires_grad_(True) for A, _ in adapters]  # noqa: B023
-                Bs = [B.clone().requires_grad_(True) for _, B in adapters]  # noqa: B023
+            def run_qkv(mods=mods, adapters=adapters, dYs=dYs, batched=batched):
+                As = [A.clone().requires_grad_(True) for A, _ in adapters]
+                Bs = [B.clone().requires_grad_(True) for _, B in adapters]
                 Xc = X.clone().requires_grad_(True)
                 Q, K, V = LoRA_QKV.apply(
-                    Xc, None,
-                    None, None, mods[0], As[0], Bs[0], 2.0, None, None,  # noqa: B023
-                    None, None, mods[1], As[1], Bs[1], 2.0, None, None,  # noqa: B023
-                    None, None, mods[2], As[2], Bs[2], 2.0, None, None,  # noqa: B023
-                    True, batched,  # noqa: B023
+                    Xc,
+                    None,
+                    None,
+                    None,
+                    mods[0],
+                    As[0],
+                    Bs[0],
+                    2.0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    mods[1],
+                    As[1],
+                    Bs[1],
+                    2.0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    mods[2],
+                    As[2],
+                    Bs[2],
+                    2.0,
+                    None,
+                    None,
+                    True,
+                    batched,
                 )
-                torch.autograd.backward([Q, K, V], dYs)  # noqa: B023
+                torch.autograd.backward([Q, K, V], dYs)
                 return (
                     [t.detach().reshape(-1, t.shape[-1]) for t in (Q, K, V)],
                     Xc.grad.detach(),
@@ -1568,11 +1614,36 @@ class TestNVFP4BaseResidual:
             Bs = [B.clone().requires_grad_(True) for _, B in adapters]
             Xc = X.clone().requires_grad_(True)
             out = LoRA_MLP.apply(
-                Xc, None,
-                None, None, mods[0], As[0], Bs[0], 2.0, None, None,
-                None, None, mods[1], As[1], Bs[1], 2.0, None, None,
-                None, None, mods[2], As[2], Bs[2], 2.0, None, None,
-                act_fwd, act_bwd, True, False,
+                Xc,
+                None,
+                None,
+                None,
+                mods[0],
+                As[0],
+                Bs[0],
+                2.0,
+                None,
+                None,
+                None,
+                None,
+                mods[1],
+                As[1],
+                Bs[1],
+                2.0,
+                None,
+                None,
+                None,
+                None,
+                mods[2],
+                As[2],
+                Bs[2],
+                2.0,
+                None,
+                None,
+                act_fwd,
+                act_bwd,
+                True,
+                False,
             )
             out.backward(dY)
             return {
@@ -2186,14 +2257,19 @@ class TestNVFP4Sm120Gate:
     def test_gate_default_safe_on_non_blackwell(self, monkeypatch):
         """A spoofed sm_90 device must keep the gate closed regardless of probe."""
         nvmod = self._reset_probe_cache()
-        monkeypatch.setattr(
-            torch.cuda, "get_device_capability", lambda *a, **k: (9, 0)
-        )
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
         monkeypatch.setattr(nvmod, "_mslk_available", lambda: True)
 
         t = torch.empty(16, 16)
         t_cuda = type(
-            "FakeT", (), {"is_cuda": True, "dim": lambda self: 2, "shape": (16, 16), "device": "cuda:0"}
+            "FakeT",
+            (),
+            {
+                "is_cuda": True,
+                "dim": lambda self: 2,
+                "shape": (16, 16),
+                "device": "cuda:0",
+            },
         )()
         # _recipe_fusion_available reads .is_cuda/.dim()/.shape/.device only.
         assert nvmod._recipe_fusion_available(t_cuda) is False
@@ -2207,7 +2283,14 @@ class TestNVFP4Sm120Gate:
         )
         monkeypatch.setattr(nvmod, "_mslk_available", lambda: True)
         t_cuda = type(
-            "FakeT", (), {"is_cuda": True, "dim": lambda self: 2, "shape": (16, 16), "device": "cuda:0"}
+            "FakeT",
+            (),
+            {
+                "is_cuda": True,
+                "dim": lambda self: 2,
+                "shape": (16, 16),
+                "device": "cuda:0",
+            },
         )()
 
         monkeypatch.setattr(nvmod, "_sm120f_recipe_codegen_verified", lambda: False)
@@ -2235,9 +2318,12 @@ class TestNVFP4Sm120Gate:
         self._reset_probe_cache()
         assert _sm120f_recipe_codegen_verified() is True
 
-        assert _recipe_fusion_available(
-            torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-        ) is True
+        assert (
+            _recipe_fusion_available(
+                torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+            )
+            is True
+        )
 
         # Independent bit-exact re-check of the RTN cvt against torchao on the
         # SAME seeded tile the probe uses. Bit-exactness is the gross-miscompile

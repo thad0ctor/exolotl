@@ -23,8 +23,7 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.skipif(
         not (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_capability() >= (10, 0)
+            torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
         ),
         reason="native NVFP4 attention requires sm>=100 (Blackwell)",
     ),
@@ -269,12 +268,23 @@ def test_custom_op_backward_routing(monkeypatch):
     q, k, v = _qkv(d, seed=33)
     with pytest.raises(ValueError, match="not both"):
         op_mod.nvfp4_flash_attn_train_custom_op(
-            q, k, v, scaling, causal=True, num_key_value_groups=NG,
-            backward_grad_dots="bf16", backward_bf16_grad_dots=True,
+            q,
+            k,
+            v,
+            scaling,
+            causal=True,
+            num_key_value_groups=NG,
+            backward_grad_dots="bf16",
+            backward_bf16_grad_dots=True,
         )
     with pytest.raises(ValueError, match="backward_grad_dots must be one of"):
         op_mod.nvfp4_flash_attn_train_custom_op(
-            q, k, v, scaling, causal=True, num_key_value_groups=NG,
+            q,
+            k,
+            v,
+            scaling,
+            causal=True,
+            num_key_value_groups=NG,
             backward_grad_dots="fp16",
         )
 
@@ -340,9 +350,7 @@ def test_vl_monkeypatch_plumbs_grad_dots(monkeypatch):
 
     model = _build_vl_model(seed=6)
     hidden = model.config.hidden_size
-    patched = patch_qwen3_vl_nvfp4_attention(
-        model, train_backward=True, grad_dots=None
-    )
+    patched = patch_qwen3_vl_nvfp4_attention(model, train_backward=True, grad_dots=None)
     assert patched > 0
     assert model.layers[0].self_attn._nvfp4_grad_dots is None
 
@@ -358,9 +366,7 @@ def test_vl_monkeypatch_plumbs_grad_dots(monkeypatch):
 
     # Forcing the legacy mode must fall back to the all-FP4 backward.
     calls.clear()
-    patch_qwen3_vl_nvfp4_attention(
-        model, train_backward=True, grad_dots="fp4_legacy"
-    )
+    patch_qwen3_vl_nvfp4_attention(model, train_backward=True, grad_dots="fp4_legacy")
     assert model.layers[0].self_attn._nvfp4_grad_dots == "fp4_legacy"
     hs2, pos2 = _vl_inputs(hidden, seed=7)
     hs2 = hs2.clone().requires_grad_(True)

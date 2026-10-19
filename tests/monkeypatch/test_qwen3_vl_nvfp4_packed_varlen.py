@@ -45,8 +45,7 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.skipif(
         not (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_capability() >= (10, 0)
+            torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0)
         ),
         reason="native NVFP4 attention requires sm>=100 (Blackwell)",
     ),
@@ -401,9 +400,7 @@ def test_vl_packed_classification_cached_once_per_step(monkeypatch):
     """The VL packed classification is computed ONCE per distinct position_ids
     tensor (cached on the tensor): repeated layer calls within a step reuse it."""
     model, cfg = _build_model(seed=8)
-    patch_qwen3_vl_nvfp4_attention(
-        model, train_backward=True, packed_min_sample_len=0
-    )
+    patch_qwen3_vl_nvfp4_attention(model, train_backward=True, packed_min_sample_len=0)
     hs0, w = _packed_inputs(cfg.hidden_size, seed=8)
     text, mrope = _packed_positions()
 

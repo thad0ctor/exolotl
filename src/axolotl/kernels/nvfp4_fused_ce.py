@@ -226,7 +226,9 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, hidden, store, labels, ignore_index, scale, grad_scale, res_A, res_B):
+    def forward(
+        ctx, hidden, store, labels, ignore_index, scale, grad_scale, res_A, res_B
+    ):
         # hidden: [M, H] (2D, contiguous), labels: [M]
         # res_A [V,k] / res_B [k,H]: optional low-rank bf16 head residual; logits
         # get + (hidden @ res_B.t()) @ res_A[lo:hi].t() per tile (None = no residual).
@@ -243,7 +245,6 @@ class _FusedFP4CrossEntropy(torch.autograd.Function):
         )
         running_sum = torch.zeros(M, device=device, dtype=torch.float32)
         label_logit = torch.zeros(M, device=device, dtype=torch.float32)
-
 
         for lo in range(0, V, _VOCAB_BLOCK):
             hi = min(lo + _VOCAB_BLOCK, V)
@@ -329,7 +330,9 @@ class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
     """Tiled CE whose lm_head logits are produced by FP4 ``torch._scaled_mm``."""
 
     @staticmethod
-    def forward(ctx, hidden, store, labels, ignore_index, scale, grad_scale, res_A, res_B):
+    def forward(
+        ctx, hidden, store, labels, ignore_index, scale, grad_scale, res_A, res_B
+    ):
         M, _ = hidden.shape
         V = store.shape[0]
         device = hidden.device
@@ -399,7 +402,6 @@ class _FusedFP4ScaledMMCrossEntropy(torch.autograd.Function):
         coef = (grad_loss * ctx.grad_scale * valid.float() * scale).unsqueeze(1)
         rows = torch.arange(M, device=hidden.device)
 
-
         grad_hidden = torch.zeros(M, H, device=hidden.device, dtype=dtype)
         for lo in range(0, V, _VOCAB_BLOCK):
             hi = min(lo + _VOCAB_BLOCK, V)
@@ -466,14 +468,19 @@ def fused_fp4_cross_entropy(
     res_A = getattr(lm_head, "_lm_head_residual_A", None)
     res_B = getattr(lm_head, "_lm_head_residual_B", None)
 
-
     if _fp4_scaled_mm_enabled(fp4_matmul):
         fp4_store = _nvfp4_lm_head_fp4_store(lm_head)
         if fp4_store is not None:
             try:
                 return _FusedFP4ScaledMMCrossEntropy.apply(
-                    hidden2d, fp4_store, labels1d, ignore_index, logit_scale,
-                    grad_scale, res_A, res_B,
+                    hidden2d,
+                    fp4_store,
+                    labels1d,
+                    ignore_index,
+                    logit_scale,
+                    grad_scale,
+                    res_A,
+                    res_B,
                 )
             except Exception:
                 if fp4_matmul is True:

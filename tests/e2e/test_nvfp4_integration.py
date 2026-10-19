@@ -434,6 +434,8 @@ def test_gate_refuses_qwen3_5_only_module_flags_on_qwen3_vl(monkeypatch, flag):
             model_config_type="qwen3_vl",
             nvfp4_training={"enabled": True, flag: True},
         )
+
+
 def test_schema_base_residual_defaults_on(monkeypatch):
     """base_residual is the DEFAULT-ON product decision: a bare nvfp4_training
     block already carries enabled=True, rank 16, activation calibration."""
@@ -952,9 +954,7 @@ def test_calib_input_ids_resolve_from_threaded_train_dataset():
 
     sample = list(range(1000, 1064))
     ds = Dataset.from_dict({"input_ids": [sample, list(range(7))]})
-    pm = PatchManager(
-        DictDefault({}), model_config=DictDefault({}), train_dataset=ds
-    )
+    pm = PatchManager(DictDefault({}), model_config=DictDefault({}), train_dataset=ds)
 
     class _Model:
         # Tiny vocab: the arange fallback would emit ids < 8, so any value from
@@ -991,9 +991,7 @@ def test_model_loader_threads_train_dataset_to_patch_manager(monkeypatch):
     import axolotl.loaders.model as model_mod
     from axolotl.utils.dict import DictDefault
 
-    monkeypatch.setattr(
-        model_mod, "load_model_config", lambda cfg: DictDefault({})
-    )
+    monkeypatch.setattr(model_mod, "load_model_config", lambda cfg: DictDefault({}))
     ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4]]})
     loader = model_mod.ModelLoader(
         DictDefault({"base_model": "dummy"}), tokenizer=None, train_dataset=ds
@@ -1206,12 +1204,8 @@ def test_apply_qwen3_vl_routes_to_vl_attention_not_qwen3_5(monkeypatch):
     def fail_qwen35(*_a, **_k):  # pragma: no cover - must not be called
         raise AssertionError("qwen3_vl must not call the Qwen3.5 attention patch")
 
-    monkeypatch.setattr(
-        nvfp4_flash_attn_vl, "patch_qwen3_vl_nvfp4_attention", fake_vl
-    )
-    monkeypatch.setattr(
-        nvfp4_flash_attn, "patch_qwen3_5_nvfp4_attention", fail_qwen35
-    )
+    monkeypatch.setattr(nvfp4_flash_attn_vl, "patch_qwen3_vl_nvfp4_attention", fake_vl)
+    monkeypatch.setattr(nvfp4_flash_attn, "patch_qwen3_5_nvfp4_attention", fail_qwen35)
     pm = _patch_manager(
         {
             "model_config_type": "qwen3_vl",
@@ -1256,9 +1250,7 @@ def test_apply_qwen3_vl_skips_attention_when_disabled(monkeypatch):
         called["n"] += 1
         return 0
 
-    monkeypatch.setattr(
-        nvfp4_flash_attn_vl, "patch_qwen3_vl_nvfp4_attention", fake_vl
-    )
+    monkeypatch.setattr(nvfp4_flash_attn_vl, "patch_qwen3_vl_nvfp4_attention", fake_vl)
     pm = _patch_manager(
         {
             "model_config_type": "qwen3_vl",

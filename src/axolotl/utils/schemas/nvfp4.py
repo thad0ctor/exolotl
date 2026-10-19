@@ -406,6 +406,7 @@ class NVFP4AttentionConfig(BaseModel):
     def compile_custom_op_set(self) -> bool:
         return bool(self.backward.compile_custom_op)
 
+
 class BaseResidualConfig(BaseModel):
     """Low-rank bf16 L2QER residual on EVERY frozen FP4 base linear (LoRA/QLoRA).
 
