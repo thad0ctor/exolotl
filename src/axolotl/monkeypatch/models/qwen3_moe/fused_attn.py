@@ -46,7 +46,10 @@ def _make_fused_forward():
         hidden_shape = (*input_shape, -1, self.head_dim)
         q_norm = _resolve_norm_module(self.q_norm)
         k_norm = _resolve_norm_module(self.k_norm)
-        eps = q_norm.variance_epsilon
+        # Liger's RMSNorm replacement exposes ``eps`` instead of ``variance_epsilon``.
+        eps = getattr(q_norm, "eps", None)
+        if eps is None:
+            eps = q_norm.variance_epsilon
 
         cos, sin = position_embeddings
 

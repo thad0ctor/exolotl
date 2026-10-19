@@ -179,6 +179,10 @@ lora-out/*
 qlora-out/*
 mlruns/*
 
+# Benchmark output (machine-specific, regenerate via scripts/benchmark_*.py)
+scripts/*_results.json
+scripts/**/*_results.json
+
 /.quarto/
 prepared-datasets/
 submit.sh

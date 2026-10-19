@@ -1,0 +1,63 @@
+# Maintainer acceptance: 8B QLoRA on one 24 GiB GPU.
+base_model: NousResearch/Meta-Llama-3-8B-Instruct
+model_type: LlamaForCausalLM
+
+load_in_8bit: false
+load_in_4bit: true
+strict: false
+
+datasets:
+  - path: tatsu-lab/alpaca
+    type: alpaca
+val_set_size: 0.0
+output_dir: ./outputs/protrain-validation-8b-qlora
+
+sequence_len: 256
+sample_packing: false
+pad_to_sequence_len: false
+
+adapter: qlora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - up_proj
+  - down_proj
+  - gate_proj
+
+plugins:
+  - axolotl.integrations.protrain.ProTrainPlugin
+
+protrain_auto_memory: true
+protrain_auto_mode: true
+
+gradient_accumulation_steps: 4
+micro_batch_size: 1
+max_steps: 50
+optimizer: adamw_torch
+lr_scheduler: cosine
+learning_rate: 0.0002
+
+bf16: true
+fp16: false
+tf32: false
+
+gradient_checkpointing: false
+flash_attention: true
+xformers_attention: false
+
+lora_mlp_kernel: false
+lora_qkv_kernel: false
+lora_o_kernel: false
+
+logging_steps: 1
+save_steps: 50
+save_first_step: false
+save_total_limit: 2
+
+warmup_steps: 2
+weight_decay: 0.0
