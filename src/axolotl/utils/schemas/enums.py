@@ -122,6 +122,7 @@ CANONICAL_ATTN_IMPLS = frozenset(
         "varlen",
         "xformers",
         "sage",
+        "sage_fp4",
         "fp8",
     }
 )

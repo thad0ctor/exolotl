@@ -1,0 +1,183 @@
+# Fastest measured native NVFP4 training path for Qwen3.5-9B LoRA on Blackwell.
+#
+# FINAL MEASURED TABLE (2026-06-10, RTX PRO 6000, b4 s2048 packed, same
+# data/LR/140-step marginal method; full stack = FP4 linears + base/lm_head
+# L2QER residuals + NVFP4 varlen attention with the HP backward):
+#   bf16 base + flash-attn-2:        1.581 s/step  loss 0.917  65.9 GiB
+#   FP4 linears + flash-attn-2:      1.114 s/step  loss 0.941  60.3 GiB
+#   full FP4 stack (varlen, resid):  1.113 s/step  loss 0.942  61.8 GiB
+# i.e. the complete NVFP4 stack trains 1.42x faster than bf16 at -6% memory
+# with a +0.025 loss gap @140 steps; vs the flash-attention config it is
+# speed/loss parity on short-sample packs (the packed_min_sample_len gate
+# routes those to FA2-varlen) and pulls ahead on long effective contexts.
+#
+# UPDATE (HP-grad-dots backward): the sageattention fork now ships an
+# HP-grad-dots attention backward (FP4 S/dP recomputes + bf16 grad GEMMs with
+# exact operands) that is ~1.5-1.7x faster than the legacy all-FP4 backward,
+# much more accurate (grad cosine vs bf16 SDPA ~0.991 vs ~0.94 RTN / ~0.82 SR),
+# and uses ~4x less backward scratch memory. It auto-enables whenever
+# attention.backward.save_packs is OFF. save_packs: true now FORCES the slower
+# legacy all-FP4 backward (the HP path needs the saved high-precision q/k/v),
+# so the recommended fastest setting is now save_packs: false (optionally with
+# an explicit bf16_grad_dots: true). The measured numbers below PREDATE the HP
+# backward and were taken with the legacy saved-pack backward.
+#
+# Same-day HP-vs-legacy A/B on THIS config (bench_nvfp4.sh, RTX PRO 6000 #2):
+#   s2048 b4: legacy save_packs 1.1367 s/step 61.43 GiB loss 0.986
+#             HP backward       1.1568 s/step 61.79 GiB loss 0.952
+#   s8192 b1 (packs auto-disabled >4096; legacy forced via bf16_grad_dots:false):
+#             legacy 1.1260 s/step loss 1.016 | HP 1.1425 s/step loss 0.974
+# Step time/memory are PARITY within method noise on this hybrid model
+# (attention is 8/32 layers and a small slice of the step at these shapes) —
+# the HP gains here are GRADIENT QUALITY (consistently lower loss at equal
+# steps, grad cos 0.991 vs <=0.94) and stability (one legacy run locked the
+# GPU, Xid 8, at step 125; HP runs were clean). The 1.5-1.7x backward kernel
+# speedup matters for attention-dominated shapes (long context, dense-attn
+# models, large micro-batches).
+#
+# Target shape: text-only SFT, sequence_len 2048, sample packing, no gradient
+# checkpointing. Measured on RTX PRO 6000 Blackwell 96GB with
+# scripts/bench_nvfp4.sh (20 -> 60 marginal train_runtime):
+#   bf16 b6 stable baseline: 2.1550 s/step, ~5701 tok/s, 89.61 GiB active
+#                              (learning_rate 2e-5; finite grad norms)
+#   all-on NVFP4 b4 baseline: 1.2475 s/step, ~6567 tok/s, 69.26 GiB active
+#   this saved-pack path:      1.1525-1.2075 s/step, ~6784-7108 tok/s,
+#                              69.63 GiB active
+#   plus FLA boundary:         1.1708 s/step, ~6997 tok/s, 69.63 GiB active
+#   plus BF16 dK/dV scratch:   1.1415-1.1485 s/step, ~7133-7177 tok/s,
+#                              62.03 GiB active
+#   beta lock-down repeat:     1.2017 s/step, ~6817 tok/s,
+#                              62.03 GiB active
+#   clean GPU3 repeat:         1.0635 s/step, ~7701 tok/s,
+#                              69.63 GiB active
+#   b5 no CE repeat:           1.5195 s/step, ~6740 tok/s,
+#                              74.43 GiB active
+#   b6 no CE repeat:           1.8473 s/step, ~6652 tok/s,
+#                              86.83 GiB active
+#   FP8 lm_head CE b6:         1.7700-1.7807 s/step, ~6902-6943 tok/s,
+#                              80.32 GiB active (slower; one validation run
+#                              loss-collapsed with non-finite grad norms)
+#   FP8 lm_head CE b5 repeat:  1.5312 s/step, ~6688 tok/s, 69.60 GiB active
+#                              (memory win, not a throughput win)
+#
+# Do not use fp16 as the convergence baseline here: with NVFP4 omitted and
+# max_grad_norm: 1.0 explicit, fp16 produced NaN LoRA gradients at the first AMP
+# unscale. bf16 is the natural full-precision Blackwell baseline.
+#
+# The historical speed knob here was attention.backward.save_packs (forward FP4
+# pack reuse in backward, ~0.4 GiB activation memory for less pack-prep work);
+# with the HP-grad-dots backward it is now a SLOWDOWN switch — see the UPDATE
+# note above. The FLA boundary prevents
+# variable packed cu_seqlens from burning compile time in causal_conv1d. BF16
+# dK/dV scratch reduces the legacy attention-backward scratch traffic before GQA
+# reduce (moot on the HP-grad-dots path).
+# The no-grad/eval-only Qwen3.5 native MLP, native linear-attn, fused v_proj,
+# standalone fp8_lm_head, FP8 lm_head CE, CCE, and Liger fused-linear CE
+# switches are intentionally omitted. Same-prepared-data ablations measured:
+# 1.2017 s/step without legacy switches vs 1.2335 s/step with them; FP8 CE b5
+# 1.5312 s/step; CCE/Liger CE loss-collapse with non-finite grad norms in this
+# NVFP4 training setup.
+#
+# base_mode: compute pre-quantizes the frozen base into the two NVFP4 layouts so
+# fprop and dgrad run as pure FP4 GEMMs with no per-step base-quant prologue.
+#
+# For benchmark comparisons, copy this config to /tmp, set base_model to the
+# local model path, and keep dataset_prepared_path fixed across compared runs.
+base_model: Qwen/Qwen3.5-9B
+model_config_type: qwen3_5
+strict: false
+
+chat_template: qwen3_5
+datasets:
+  - path: yahma/alpaca-cleaned
+    type: alpaca
+val_set_size: 0.0
+dataset_prepared_path: /tmp/axolotl_nvfp4_qwen35_fastest_prepared
+output_dir: /tmp/axolotl_nvfp4_qwen35_fastest_out
+
+sequence_len: 2048
+sample_packing: true
+pad_to_sequence_len: true
+
+load_in_8bit: false
+load_in_4bit: false
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  - linear_attn.in_proj_qkv
+  - linear_attn.in_proj_z
+  - linear_attn.out_proj
+
+gradient_accumulation_steps: 1
+# This measured b4 path targets 96GB Blackwell. Reduce micro_batch_size on
+# smaller cards or enable gradient_checkpointing if you need memory headroom.
+micro_batch_size: 4
+num_epochs: 1
+optimizer: adamw_torch_fused
+lr_scheduler: cosine
+learning_rate: 2.0e-4
+max_grad_norm: 1.0
+
+bf16: true
+fp16: false
+tf32: true
+torch_compile: true
+
+gradient_checkpointing: false
+attn_implementation: flash_attention_2
+
+nvfp4_training:
+  enabled: true
+  base_mode: compute
+  stochastic_rounding: true
+  hadamard: true
+  exclude_modules: [lm_head, embed_tokens]
+  skip_first_n_blocks: 0
+  skip_last_n_blocks: 0
+  fuse_rmsnorm: false
+  # Reuse one NVFP4 activation pack across fused LoRA QKV/QK base fprops.
+  # Locally faster in the QKV microbench, but below whole-step noise on this
+  # 8-full-attention-layer hybrid model. Try true on models with more attention layers.
+  shared_lora_base_fprop: false
+  # max-throughput vocab tile; default is 4096 (lighter). speed knee, loss-invariant
+  fused_ce_vocab_block: 8192
+
+  # Native full-attention training path. With the HP-grad-dots backward,
+  # save_packs: false is the fastest setting (the HP backward auto-enables and
+  # replaces the legacy all-FP4 backward; save_packs: true would force the
+  # slower legacy path). rtn_grad_packs/dkdv_scratch_bf16 only affect the
+  # legacy backward and are inert while the HP path is active.
+  # PACKED batches (sample_packing flattens the batch to one row, boundaries in
+  # position_ids) now run VARLEN block-diagonal causal attention (cu_seqlens):
+  # correct packing semantics (no cross-sample attention) and the dense-pack
+  # penalty is gone — work scales with sum(s_i^2) instead of S^2 (measured
+  # 10.9 ms -> 1.43 ms fwd+bwd on an 8192-token pack). Varlen only exists on
+  # the HP backward, so on packed batches save_packs: true (already
+  # discouraged) and bf16_grad_dots: false are INAPPLICABLE and are overridden
+  # with a one-time INFO; they still apply to dense (unpacked) batches.
+  attention:
+    enabled: true
+    backward:
+      enabled: true
+      rtn_grad_packs: true
+      save_packs: false
+      dkdv_scratch_bf16: true
+      # bf16_grad_dots: true  # optional; None/unset = auto-on when save_packs is off
+  fla_causal_conv_compile_boundary: true
+
+warmup_steps: 10
+logging_steps: 1
+save_strategy: "no"
+saves_per_epoch:
+evals_per_epoch:
+weight_decay: 0.0
+special_tokens:

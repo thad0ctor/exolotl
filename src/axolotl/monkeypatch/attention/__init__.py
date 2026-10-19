@@ -43,3 +43,10 @@ def register_sage_attn():
     ALL_MASK_ATTENTION_FUNCTIONS.register(
         "sage", ALL_MASK_ATTENTION_FUNCTIONS["flash_attention_2"]
     )
+
+
+def register_sage_fp4_attn():
+    """Register sage_fp4 (SageAttention-3 FP4, inference-only) backend."""
+    from .sage_fp4_attn import register_sage_fp4_attn as _register
+
+    _register()

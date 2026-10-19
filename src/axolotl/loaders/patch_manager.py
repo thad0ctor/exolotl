@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -96,6 +97,7 @@ class PatchManager:
         tokenizer: PreTrainedTokenizerBase | None = None,
         processor: ProcessorMixin | None = None,
         reference_model: bool = False,
+        train_dataset=None,
     ):
         """Initialize the `PatchManager`.
 
@@ -103,6 +105,10 @@ class PatchManager:
             cfg: Configuration dictionary with model and training settings.
             model_config: Configuration object for the model.
             inference: Whether the model is being loaded for inference mode.
+            train_dataset: Optional prepared (tokenized) training dataset. In the
+                standard train path datasets are prepared before the model loads;
+                threading the dataset here lets the NVFP4 residual calibration
+                (`_nvfp4_calib_input_ids`) forward a real sample at swap time.
         """
         self.cfg = cfg
         self.model_config = model_config
@@ -110,6 +116,7 @@ class PatchManager:
         self.tokenizer = tokenizer
         self.processor = processor
         self.reference_model = reference_model
+        self.train_dataset = train_dataset
 
     def _hook_context(self, model: PreTrainedModel | None = None) -> ModelHookContext:
         return ModelHookContext(
@@ -281,8 +288,12 @@ class PatchManager:
         self._apply_lora_kernel_patch(model)
         self._apply_scaling_softmax_patch(model)
         self._apply_fp8_attention_patches(model)
+        self._apply_fp4_attention_qat(model)
+        self._apply_nvfp4_training(model)
+        self._apply_qwen3_5_native_nvfp4_patches(model)
         self._apply_tiled_mlp_post_load(model)
         self._apply_mrope_packing_patch(model)
+        self._mark_nvfp4_ddp_ignore(model)
 
     def _apply_mrope_packing_patch(self, model: PreTrainedModel):
         # mRoPE text models only isolate packed samples given [4, B, L] position ids;
@@ -416,12 +427,1041 @@ class PatchManager:
 
             register_sage_attn()
 
+        if self.cfg.attn_implementation == "sage_fp4":
+            from axolotl.monkeypatch.attention import register_sage_fp4_attn
+            from axolotl.monkeypatch.attention.sage_fp4_attn import (
+                configure_sage_fp4,
+                patch_sage_fp4_attn,
+            )
+
+            if not self.inference:
+                raise ValueError(
+                    "attn_implementation: sage_fp4 is inference-only and cannot "
+                    "be used by axolotl train. For Qwen3.5 native FP4 attention "
+                    "training, keep a training-capable attention backend such as "
+                    "flash_attention_2 and enable nvfp4_training with "
+                    "attention.enabled plus attention.backward.enabled."
+                )
+
+            patch_sage_fp4_attn()
+            sage_cfg = self.cfg.sage_fp4_attention
+            configure_sage_fp4(
+                per_block_mean=sage_cfg.per_block_mean if sage_cfg else True,
+                allow_fallback=(sage_cfg.allow_fallback if sage_cfg else True),
+            )
+            register_sage_fp4_attn()
+
     def _apply_fp8_attention_patches(self, model):
         """Apply FP8 low-precision attention via torchao."""
         if self.cfg.attn_implementation == "fp8":
             from axolotl.monkeypatch.attention.fp8_attn import patch_fp8_attention
 
             patch_fp8_attention(model)
+
+    def _apply_fp4_attention_qat(self, model: PreTrainedModel):
+        """Route attention through the NVFP4 fake-quant QAT path (opt-in).
+
+        Independent of nvfp4_training: works on a bf16 base. Routes through the
+        fused FlashAttention-style Triton kernel (linear memory) when applicable
+        and falls back to the eager materialized-P path otherwise, so it overrides
+        any flash/sdpa request — warn if the user asked for one. Post-load so it
+        sees the final model tree.
+        """
+        if not self.cfg.fp4_attention_qat:
+            return
+
+        from axolotl.utils.attn_qat import apply_nvfp4_qat_attention
+
+        requested = self.cfg.attn_implementation
+        if requested and requested not in ("eager", "nvfp4_qat"):
+            LOG.warning(
+                "fp4_attention_qat overrides attn_implementation=%s with the "
+                "NVFP4 fake-quant attention (fused flash kernel, eager fallback).",
+                requested,
+            )
+        apply_nvfp4_qat_attention(model)
+
+    def _apply_nvfp4_training(self, model: PreTrainedModel):
+        """Swap eligible linears for NVFP4-GEMM linears (Blackwell FP4 compute).
+
+        Runs in post-load (after weights + any merge AND after PEFT wraps the
+        model in ``ModelLoader._load_adapters``) so the swap sees real linear
+        modules in their final tree position. FFT swaps raw ``nn.Linear``;
+        adapter modes swap the FROZEN base_layer inside each ``lora.Linear``,
+        which only exists once PEFT has wrapped the model — hence post-load.
+        """
+        nvfp4 = self.cfg.nvfp4_training
+        if not (nvfp4 and nvfp4.enabled):
+            return
+
+        # In-process merge (legacy merge-lora) writes base_layer.weight.data +=
+        # delta; the FP4 base modules expose weight read-only, so that write
+        # would silently no-op. Keep the base in bf16 for merge — merge_and_unload
+        # then merges into the real weight. (FP4 training is irrelevant at merge.)
+        if self.cfg.merge_lora:
+            return
+
+        from axolotl.kernels.lora import set_nvfp4_shared_base_fprop
+        from axolotl.utils.nvfp4_training import (
+            NVFP4Recipe,
+            convert_lora_base_to_nvfp4,
+            convert_to_nvfp4_training,
+        )
+
+        recipe = NVFP4Recipe(
+            stochastic_rounding=nvfp4.stochastic_rounding,
+            hadamard=nvfp4.hadamard,
+        )
+        shared_lora_base_fprop = set_nvfp4_shared_base_fprop(
+            getattr(nvfp4, "shared_lora_base_fprop", None)
+        )
+        exclude_modules = list(nvfp4.exclude_modules or [])
+        if getattr(nvfp4, "quantize_lm_head", False):
+            exclude_modules = self._nvfp4_unexclude_lm_head(model, exclude_modules)
+        exclude = tuple(exclude_modules) + self._nvfp4_block_exclusions(
+            model, nvfp4.skip_first_n_blocks or 0, nvfp4.skip_last_n_blocks or 0
+        )
+
+        adapter = self.cfg.adapter
+        if shared_lora_base_fprop:
+            LOG.info("NVFP4 LoRA shared base fprop enabled")
+
+        # Transformer Engine backend: swap eligible linears to te.Linear; the
+        # trainer wraps the step in te.fp8_autocast (set up below via a stored
+        # recipe). FFT swaps raw nn.Linear; LoRA swaps the frozen base_layer
+        # inside each lora.Linear (adapters stay high-precision).
+        if getattr(nvfp4, "backend", "native") == "te":
+            from axolotl.utils.nvfp4_training import (
+                convert_lora_base_to_te_nvfp4,
+                convert_to_te_nvfp4_training,
+                te_nvfp4_available,
+                te_nvfp4_recipe,
+            )
+
+            ok, reason = te_nvfp4_available()
+            if not ok:
+                raise RuntimeError(reason)
+            # te keeps an HP (bf16) base and quantizes on the fly: it has no
+            # FP4-storage path, so a requested storage/compute base_mode would
+            # silently give no memory saving. Steer the user to backend: native.
+            if adapter in ("lora", "qlora") and (
+                nvfp4.quantize_base
+                or getattr(nvfp4, "base_mode", None) in ("storage", "compute")
+            ):
+                LOG.warning(
+                    "nvfp4_training.backend: te ignores base_mode/quantize_base "
+                    "(te keeps a high-precision base, no FP4 storage saving). Use "
+                    "backend: native for FP4-stored/compute LoRA bases."
+                )
+            if adapter in ("lora", "qlora"):
+                count = convert_lora_base_to_te_nvfp4(model, recipe, exclude=exclude)
+                empty_msg = (
+                    "nvfp4_training(te) enabled but no eligible LoRA base layers "
+                    "were swapped (is the model PEFT-wrapped?)"
+                )
+            elif adapter:
+                raise ValueError(
+                    f"nvfp4_training.backend: te supports full fine-tune or "
+                    f"lora/qlora, not adapter={adapter}."
+                )
+            else:
+                count = convert_to_te_nvfp4_training(model, recipe, exclude=exclude)
+                empty_msg = "nvfp4_training(te) enabled but no nn.Linear swapped"
+            model._te_nvfp4_recipe = te_nvfp4_recipe(recipe)
+            if count == 0:
+                LOG.warning(empty_msg)
+            return
+
+        if adapter in ("lora", "qlora"):
+            # Resolve the base mode. Explicit base_mode wins; otherwise
+            # qlora/quantize_base => FP4 storage, else default to FP4 compute
+            # (pre-quantized base, fastest, the recommended LoRA path).
+            base_mode = getattr(nvfp4, "base_mode", None)
+            if base_mode is None:
+                base_mode = (
+                    "storage"
+                    if (bool(nvfp4.quantize_base) or adapter == "qlora")
+                    else "compute"
+                )
+            compute_base = base_mode == "compute"
+            quantized_storage = base_mode == "storage"
+            # The MSLK fast path wraps quant in registered custom ops; the torchao
+            # fallback is pure-torch quant (nvfp4_quantize / _sr_dither) + an aten
+            # _scaled_mm GEMM, which is also compile-safe (verified: a compiled
+            # compute-base step with MSLK forced off completes with no graph breaks
+            # beyond the model's own data-dependent ones). MSLK is just faster, so
+            # surface it as info, not a warning.
+            if compute_base and self.cfg.torch_compile:
+                from axolotl.utils.nvfp4_training import _mslk_available
+
+                if not _mslk_available():
+                    LOG.info(
+                        "nvfp4_training compute-base under torch_compile is using the "
+                        "torchao fallback (MSLK not installed); this is compile-safe "
+                        "but slower. Install MSLK for the faster custom-op quant path."
+                    )
+            # Both FP4 base modes need the NVFP4 all-gather hooks to shard under
+            # FSDP2 (storage: one layout; compute: fprop+dgrad layouts).
+            use_fsdp = (quantized_storage or compute_base) and bool(
+                self.cfg.fsdp_config
+            )
+            # Frozen-base L2QER residual (default ON): the activation calibration
+            # MUST run before the swap — the storage mode discards the bf16
+            # master the quant error is computed from.
+            base_residual_plan = self._nvfp4_prepare_base_residual(
+                model, exclude, base_mode
+            )
+            count = convert_lora_base_to_nvfp4(
+                model,
+                recipe,
+                quantized_storage=quantized_storage,
+                compute_base=compute_base,
+                fsdp=use_fsdp,
+                exclude=exclude,
+                base_residual=base_residual_plan,
+            )
+            empty_msg = (
+                "nvfp4_training enabled but no eligible LoRA base layers were "
+                "swapped (is the model PEFT-wrapped?)"
+            )
+        else:
+            base_mode = getattr(nvfp4, "base_mode", None) or "compute"
+            # base_residual corrects FROZEN FP4 stores; full fine-tune weights are
+            # trainable (re-quantized every step), so a load-time residual would
+            # go stale immediately — leave full-FT untouched.
+            LOG.debug(
+                "nvfp4 base_residual: full fine-tune keeps trainable bf16 masters "
+                "(no frozen FP4 base store); base_residual does not apply."
+            )
+            count = convert_to_nvfp4_training(model, recipe, exclude=exclude)
+            empty_msg = (
+                "nvfp4_training enabled but no eligible nn.Linear layers were swapped"
+            )
+        if count == 0:
+            LOG.warning(empty_msg)
+
+        # lm_head / input-embedding / tied-shared-weight swaps (each opt-in). The
+        # LoRA base converter only touches lora.Linear base_layers, so a frozen
+        # lm_head/embedding that isn't a LoRA target is invisible to it and is
+        # handled here.
+        self._nvfp4_apply_tied_or_lm_head(model, recipe, base_mode)
+
+        # Vision-tower encoder linears (multimodal, opt-in): frozen nn.Linear
+        # under the vision module stay bf16 otherwise (not lora.Linear).
+        if getattr(nvfp4, "quantize_vision_tower", False):
+            from axolotl.utils.nvfp4_training import convert_vision_tower_to_nvfp4
+
+            convert_vision_tower_to_nvfp4(model, recipe, base_mode=base_mode)
+
+        # Fuse decoder RMSNorm + activation quant into one kernel so the base
+        # linear reuses the norm's pre-quantized activation (native backend only;
+        # the fused norm emits single-level FP4, matching the compute-base path).
+        if getattr(nvfp4, "fuse_rmsnorm", True):
+            from axolotl.utils.nvfp4_training import convert_norms_to_nvfp4_fused
+
+            convert_norms_to_nvfp4_fused(model)
+
+        if getattr(nvfp4, "fuse_qk_norm_rope", False):
+            from axolotl.monkeypatch.models.qwen_fused_attn import patch_qwen_fused_attn
+
+            patch_qwen_fused_attn(self.cfg.model_config_type)
+
+        self._nvfp4_load_packed_sidecar(model)
+
+        # Fused FP4 lm_head + cross-entropy: skip materializing the [M, vocab]
+        # logits (memory win). Opt-in and only when the lm_head became an FP4
+        # store above; falls back to the materialized CE path otherwise.
+        #
+        # When lm_head_distillation is enabled, its own forward patch already runs
+        # the fused FP4 CE (then adds the KL term) and owns the head computation —
+        # installing the plain fused-CE wrapper on top would shadow the KL term, so
+        # skip it (the distillation forward calls fused_fp4_cross_entropy directly).
+        _distill = getattr(nvfp4, "lm_head_distillation", None)
+        _distill_on = _distill is not None and getattr(_distill, "enabled", False)
+        if (
+            getattr(nvfp4, "fused_fp4_cross_entropy", False)
+            and getattr(nvfp4, "quantize_lm_head", False)
+            and not _distill_on
+        ):
+            from axolotl.kernels.nvfp4_fused_ce import patch_model_fused_fp4_ce
+
+            patch_model_fused_fp4_ce(
+                model,
+                fp4_matmul=True
+                if getattr(nvfp4, "fused_fp4_cross_entropy_fp4_matmul", False)
+                else None,
+                vocab_block=getattr(nvfp4, "fused_ce_vocab_block", None),
+            )
+
+        if getattr(nvfp4, "fp8_lm_head", False):
+            from axolotl.kernels.fp8_lm_head import patch_model_fp8_lm_head
+
+            patch_model_fp8_lm_head(
+                model,
+                granularity=getattr(nvfp4, "fp8_lm_head_granularity", "rowwise"),
+            )
+
+        if getattr(nvfp4, "fp8_lm_head_cross_entropy", False):
+            from axolotl.kernels.fp8_fused_ce import (
+                patch_model_fp8_lm_head_cross_entropy,
+            )
+
+            patch_model_fp8_lm_head_cross_entropy(
+                model,
+                granularity=getattr(nvfp4, "fp8_lm_head_granularity", "rowwise"),
+            )
+
+        if getattr(nvfp4, "bf16_lm_head_cross_entropy", False):
+            from axolotl.kernels.bf16_fused_ce import (
+                patch_model_bf16_lm_head_cross_entropy,
+            )
+
+            patch_model_bf16_lm_head_cross_entropy(model)
+
+    def _mark_nvfp4_ddp_ignore(self, model: PreTrainedModel):
+        """Exclude NVFP4 frozen-base buffers from DDP's param/buffer sync.
+
+        DDP NCCL-broadcasts module states across ranks (at init and, with
+        broadcast_buffers, every step), but NCCL has no support for the packed
+        ``Float4_e2m1fn_x2`` / fp8-scale dtypes the NVFP4 base stores — it raises
+        "Input tensor data type is not supported for NCCL process group". Those
+        buffers are frozen and bit-identical on every rank (deterministic quant),
+        so they never need syncing; naming them in
+        ``_ddp_params_and_buffers_to_ignore`` (read natively by DDP) skips them.
+        """
+        nvfp4 = self.cfg.nvfp4_training
+        if not (nvfp4 and nvfp4.enabled):
+            return
+
+        exotic = {torch.float8_e4m3fn, torch.float8_e5m2}
+        fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4 is not None:
+            exotic.add(fp4)
+
+        ignore = [
+            name
+            for name, buf in model.named_buffers()
+            if buf is not None
+            and (type(buf).__name__ == "NVFP4Tensor" or buf.dtype in exotic)
+        ]
+        if not ignore:
+            return
+
+        existing = list(getattr(model, "_ddp_params_and_buffers_to_ignore", []))
+        model._ddp_params_and_buffers_to_ignore = list(dict.fromkeys(existing + ignore))
+        LOG.info("NVFP4: excluded %d FP4 base buffers from DDP sync", len(ignore))
+
+    def _apply_qwen3_5_native_nvfp4_patches(self, model: PreTrainedModel):
+        nvfp4 = self.cfg.nvfp4_training
+        if not (nvfp4 and nvfp4.enabled):
+            return
+        attn = nvfp4.attention
+
+        # Qwen3-VL: standard (non-gated) attention + multimodal mRoPE -> dedicated
+        # VL patch (the Qwen3.5 patch assumes gated q + plain RoPE). Only the
+        # attention path applies; VL has no DeltaNet linear_attn / Qwen3.5 MLP.
+        if self.cfg.model_config_type == "qwen3_vl":
+            if attn.enabled and not attn.allow_full_model:
+                # Qwen3-VL is NON-hybrid: every LM layer is full softmax attention.
+                # FP4 attention is ~0.97 cosine per layer, which compounds over all
+                # ~36 layers (~0.97^36 -> ~0.3) and wrecks the forward (step-1 loss
+                # ~5.3 vs ~1.4 without it). Refuse rather than silently train garbage.
+                LOG.warning(
+                    "nvfp4_training.attention.enabled is set on a non-hybrid Qwen3-VL "
+                    "model, where FP4 attention would touch EVERY layer; the per-layer "
+                    "FP4 error (~0.97 cos) compounds over all layers and destroys the "
+                    "forward (step-1 loss ~5.3 vs ~1.4). Disabling native FP4 attention "
+                    "(FP4 base weights/lm_head still apply). Set "
+                    "nvfp4_training.attention.allow_full_model: true to override."
+                )
+                return
+            if attn.enabled:
+                LOG.warning(
+                    "nvfp4_training.attention.allow_full_model is set: enabling native "
+                    "FP4 attention on ALL Qwen3-VL layers. Expect a large forward "
+                    "degradation (step-1 loss ~5.3 vs ~1.4) from compounded FP4 error."
+                )
+                from axolotl.monkeypatch.attention.nvfp4_flash_attn_vl import (
+                    patch_qwen3_vl_nvfp4_attention,
+                )
+
+                patch_qwen3_vl_nvfp4_attention(
+                    model,
+                    train_backward=attn.backward.enabled,
+                    backward_rtn_grad_packs=attn.backward.rtn_grad_packs,
+                    save_backward_packs=attn.backward.save_packs,
+                    dkdv_scratch_bf16=attn.backward.dkdv_scratch_bf16,
+                    grad_dots=attn.backward.grad_dots,
+                    compile_custom_op=bool(attn.backward.compile_custom_op),
+                    stochastic_rounding=nvfp4.stochastic_rounding,
+                    packed_min_sample_len=attn.packed_min_sample_len,
+                )
+            return
+
+        if self.cfg.model_config_type not in ("qwen3_5", "qwen3_5_moe"):
+            return
+
+        if attn.enabled:
+            from axolotl.monkeypatch.attention.nvfp4_flash_attn import (
+                patch_qwen3_5_nvfp4_attention,
+            )
+
+            patch_qwen3_5_nvfp4_attention(
+                model,
+                fuse_vproj=(
+                    self.inference if attn.fuse_vproj is None else attn.fuse_vproj
+                ),
+                fuse_attn_proj=attn.fp4_projections,
+                train_backward=attn.backward.enabled,
+                backward_rtn_grad_packs=attn.backward.rtn_grad_packs,
+                save_backward_packs=attn.backward.save_packs,
+                dkdv_scratch_bf16=attn.backward.dkdv_scratch_bf16,
+                grad_dots=attn.backward.grad_dots,
+                compile_custom_op=bool(attn.backward.compile_custom_op),
+                stochastic_rounding=nvfp4.stochastic_rounding,
+                packed_min_sample_len=attn.packed_min_sample_len,
+            )
+
+        if nvfp4.linear_attn:
+            from axolotl.monkeypatch.attention.nvfp4_linear_attn import (
+                patch_qwen3_5_nvfp4_linear_attn,
+            )
+
+            patch_qwen3_5_nvfp4_linear_attn(model)
+
+        if nvfp4.mlp:
+            from axolotl.monkeypatch.attention.nvfp4_mlp import (
+                patch_qwen3_5_nvfp4_mlp,
+            )
+
+            patch_qwen3_5_nvfp4_mlp(model)
+
+    def _nvfp4_load_packed_sidecar(self, model: PreTrainedModel):
+        """Restore FP4-packed weights from a save_nvfp4 sidecar, if one exists.
+
+        Looks in resume_from_checkpoint first (resume), then the base model dir
+        (loading a save_nvfp4-exported model). No-op when no sidecar is present —
+        the frozen base otherwise reconstructs deterministically from the bf16
+        weights, so this only matters for save_nvfp4 exports / exact FP4 reload.
+        """
+        import os
+
+        from axolotl.utils.nvfp4_training import (
+            NVFP4_PACKED_SIDECAR,
+            load_nvfp4_packed,
+        )
+
+        candidates = [self.cfg.resume_from_checkpoint, self.cfg.base_model]
+        for cand in candidates:
+            if not cand or not isinstance(cand, str):
+                continue
+            if os.path.isfile(os.path.join(cand, NVFP4_PACKED_SIDECAR)):
+                load_nvfp4_packed(model, cand)
+                return
+
+    @staticmethod
+    def _nvfp4_block_exclusions(
+        model: PreTrainedModel, skip_first: int, skip_last: int
+    ) -> tuple[str, ...]:
+        """Translate skip_first/last_n_blocks into ``layers.<i>.`` name fragments.
+
+        Block count is only known here (the model is built), so the block-range
+        policy is resolved in the integration layer and passed to the swap as
+        explicit ``exclude`` fragments.
+        """
+        if skip_first <= 0 and skip_last <= 0:
+            return ()
+
+        block_re = re.compile(r"(.*\blayers)\.(\d+)\.")
+        prefixes: dict[str, set[int]] = {}
+        for name, _ in model.named_modules():
+            m = block_re.match(name)
+            if m:
+                prefixes.setdefault(m.group(1), set()).add(int(m.group(2)))
+
+        fragments: list[str] = []
+        for prefix, indices in prefixes.items():
+            ordered = sorted(indices)
+            skip = set(ordered[:skip_first])
+            if skip_last > 0:
+                skip |= set(ordered[len(ordered) - skip_last :])
+            fragments.extend(f"{prefix}.{i}." for i in sorted(skip))
+        return tuple(fragments)
+
+    def _nvfp4_unexclude_lm_head(
+        self, model: PreTrainedModel, exclude_modules: list[str]
+    ) -> list[str]:
+        """Drop ``lm_head`` from the NVFP4 exclusion so the converter swaps it.
+
+        Tied embeddings are handled by the quantize-once path (see
+        ``_nvfp4_apply_tied_or_lm_head``), so a FROZEN tied weight is allowed
+        here; a TRAINABLE tied weight still raises (FP4-storing it would corrupt
+        training). A fused-linear cross-entropy path (cut_cross_entropy) consumes
+        the lm_head weight directly and bypasses the NVFP4 forward — raise. If the
+        lm_head dims aren't FP4-swappable (%32), leave it excluded with a warning
+        rather than crash. Only ``lm_head`` is removed; ``embed_tokens`` stays.
+        """
+        from axolotl.utils.nvfp4_training import _is_swappable
+
+        if self._model_ties_embeddings(model):
+            if self._tied_weight_trainable(model):
+                raise RuntimeError(
+                    "nvfp4_training.quantize_lm_head with tied embeddings requires a "
+                    "FROZEN shared weight: the output and input embeddings share one "
+                    "weight, and FP4-storing a TRAINABLE shared weight would corrupt "
+                    "training. Freeze the embedding (e.g. use LoRA, which freezes the "
+                    "base), or set quantize_lm_head: false."
+                )
+            # Frozen tied: the shared weight is quantized once and routed to both
+            # roles in _nvfp4_apply_tied_or_lm_head; the name-fragment exclusion is
+            # irrelevant for the tied path, so return unchanged.
+            return exclude_modules
+
+        nvfp4_cfg = self.cfg.nvfp4_training
+        want_fused_ce = bool(getattr(nvfp4_cfg, "fused_fp4_cross_entropy", False))
+        if self.cfg.cut_cross_entropy and not want_fused_ce:
+            raise RuntimeError(
+                "nvfp4_training.quantize_lm_head is incompatible with "
+                "cut_cross_entropy: the fused linear cross-entropy kernel reads the "
+                "lm_head weight directly to fuse the projection with the loss, which "
+                "bypasses the NVFP4 lm_head forward (the FP4 head would be ignored, "
+                "or the kernel would fail on the NVFP4 module's missing .weight). "
+                "Disable one of them (cut_cross_entropy: false or "
+                "quantize_lm_head: false), or set "
+                "nvfp4_training.fused_fp4_cross_entropy: true to use the FP4-aware "
+                "fused cross-entropy (reads the NVFP4-packed lm_head directly)."
+            )
+
+        out_emb = model.get_output_embeddings()
+        if not isinstance(out_emb, torch.nn.Linear) or not _is_swappable(out_emb):
+            in_f = getattr(out_emb, "in_features", "?")
+            out_f = getattr(out_emb, "out_features", "?")
+            LOG.warning(
+                "nvfp4_training.quantize_lm_head: lm_head is not NVFP4-swappable "
+                "(in=%s out=%s, both must be divisible by 32); keeping it in high "
+                "precision.",
+                in_f,
+                out_f,
+            )
+            return exclude_modules
+
+        without_lm_head = [m for m in exclude_modules if m != "lm_head"]
+        if "lm_head" in exclude_modules:
+            LOG.info(
+                "nvfp4_training.quantize_lm_head: removing lm_head from the "
+                "high-precision exclusion (it will be quantized to NVFP4)."
+            )
+        return without_lm_head
+
+    @staticmethod
+    def _nvfp4_swap_frozen_lm_head(
+        model, recipe, base_mode: str, retain_teacher: bool = False
+    ) -> None:
+        """Swap a bare frozen lm_head (LoRA, not a target module) to NVFP4.
+
+        Locates the output-embedding module by identity in the (possibly
+        PEFT-wrapped) tree. If it's already an NVFP4 module (e.g. the user added
+        lm_head to lora_target_modules and the LoRA converter handled it), this
+        is a no-op.
+        """
+        import torch.nn as nn
+
+        from axolotl.utils.nvfp4_training import swap_frozen_linear_to_nvfp4
+
+        out_emb = model.get_output_embeddings()
+        if not isinstance(out_emb, nn.Linear):
+            return  # already swapped (NVFP4 module) or wrapped — nothing bare to do
+        name = next(
+            (n for n, m in model.named_modules() if m is out_emb),
+            None,
+        )
+        if name is None:
+            LOG.warning(
+                "nvfp4_training.quantize_lm_head: could not locate the lm_head "
+                "module in the model tree; leaving it in high precision."
+            )
+            return
+        swap_frozen_linear_to_nvfp4(
+            model, name, recipe, base_mode=base_mode, retain_teacher=retain_teacher
+        )
+
+    @staticmethod
+    def _model_ties_embeddings(model: PreTrainedModel) -> bool:
+        """Detect weight tying between the output and input embeddings.
+
+        Checks both the config flag and weight identity — a model can tie via
+        config or via a shared parameter object even if the flag is stale.
+        """
+        if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+            return True
+        try:
+            out_emb = model.get_output_embeddings()
+            in_emb = model.get_input_embeddings()
+        except (AttributeError, NotImplementedError):
+            return False
+        out_w = getattr(out_emb, "weight", None)
+        in_w = getattr(in_emb, "weight", None)
+        return out_w is not None and in_w is not None and out_w is in_w
+
+    @staticmethod
+    def _tied_weight_trainable(model: PreTrainedModel) -> bool:
+        """Whether the shared (tied) embedding weight requires grad.
+
+        FP4-storing a trainable shared weight would corrupt training, so the
+        quantize-once path is gated on this being False.
+        """
+        try:
+            in_w = getattr(model.get_input_embeddings(), "weight", None)
+        except (AttributeError, NotImplementedError):
+            return False
+        return bool(getattr(in_w, "requires_grad", False))
+
+    def _nvfp4_apply_tied_or_lm_head(self, model, recipe, base_mode: str) -> None:
+        """Route the tied / lm_head / embedding NVFP4 swaps post linear-conversion.
+
+        Three independent flags (all OFF by default):
+        - tied + quantize_lm_head (frozen): quantize the SHARED weight once and
+          point both the embedding lookup and the lm_head GEMM at it.
+        - quantize_lm_head (untied): swap the bare frozen lm_head.
+        - quantize_embeddings: swap the frozen input embedding (also covers the
+          tied case when quantize_lm_head is off — the shared weight is stored
+          FP4 for the lookup, lm_head left HP).
+        """
+        import torch.nn as nn
+
+        from axolotl.utils.nvfp4_training import (
+            swap_frozen_embedding_to_nvfp4,
+            swap_tied_embedding_and_lm_head_to_nvfp4,
+        )
+
+        nvfp4 = self.cfg.nvfp4_training
+        want_lm_head = bool(getattr(nvfp4, "quantize_lm_head", False))
+        want_embed = bool(getattr(nvfp4, "quantize_embeddings", False))
+        if not (want_lm_head or want_embed):
+            return
+
+        # KL-distillation AND the low-rank residual both need the original bf16
+        # head retained: distillation uses it as the teacher, the residual computes
+        # the quant error E = W_bf16 - dequant(Q(W)) from it. Gated to
+        # quantize_lm_head (the validator enforces that upstream).
+        distill_cfg = getattr(nvfp4, "lm_head_distillation", None)
+        residual_cfg = getattr(nvfp4, "lm_head_residual", None)
+        retain_teacher = bool(
+            want_lm_head
+            and (
+                (distill_cfg is not None and getattr(distill_cfg, "enabled", False))
+                or (
+                    residual_cfg is not None and getattr(residual_cfg, "enabled", False)
+                )
+            )
+        )
+
+        tied = self._model_ties_embeddings(model)
+
+        if tied and want_lm_head:
+            # Frozen-tied is guaranteed here (the trainable case raised in
+            # _nvfp4_unexclude_lm_head). Quantize the shared weight once.
+            in_name = self._module_name(model, model.get_input_embeddings())
+            out_name = self._module_name(model, model.get_output_embeddings())
+            if in_name and out_name:
+                swap_tied_embedding_and_lm_head_to_nvfp4(
+                    model, in_name, out_name, recipe, retain_teacher=retain_teacher
+                )
+            self._nvfp4_attach_residual(model, residual_cfg, retain_teacher)
+            self._nvfp4_attach_distillation(model, distill_cfg, retain_teacher)
+            return
+
+        if want_lm_head:
+            # The fused FP4 cross-entropy needs a row-sliceable (non-swizzled)
+            # lm_head store; force the torchao storage class for it. Otherwise use
+            # the requested base mode (compute/storage/hp).
+            if bool(getattr(nvfp4, "fused_fp4_cross_entropy", False)):
+                import torch.nn as _nn
+
+                from axolotl.utils.nvfp4_training import swap_frozen_lm_head_tileable
+
+                out_emb = model.get_output_embeddings()
+                if isinstance(out_emb, _nn.Linear):
+                    name = self._module_name(model, out_emb)
+                    if name:
+                        swap_frozen_lm_head_tileable(
+                            model, name, recipe, retain_teacher=retain_teacher
+                        )
+            else:
+                self._nvfp4_swap_frozen_lm_head(
+                    model, recipe, base_mode, retain_teacher=retain_teacher
+                )
+            self._nvfp4_attach_residual(model, residual_cfg, retain_teacher)
+            self._nvfp4_attach_distillation(model, distill_cfg, retain_teacher)
+
+        if want_embed:
+            in_emb = model.get_input_embeddings()
+            if isinstance(in_emb, nn.Embedding):
+                in_name = self._module_name(model, in_emb)
+                if in_name:
+                    swap_frozen_embedding_to_nvfp4(model, in_name)
+
+    def _nvfp4_attach_residual(self, model, residual_cfg, retain_teacher: bool) -> None:
+        """Compute + attach the low-rank bf16 residual to the FP4 lm_head.
+
+        No-op unless lm_head_residual is enabled and the bf16 teacher weight was
+        retained (used as E = W_bf16 - dequant(Q(W))). For the activation (L2QER)
+        construction, capture calibration hidden states with one short forward over
+        a few real batches; plain SVD needs no calibration.
+        """
+        if not (
+            retain_teacher
+            and residual_cfg is not None
+            and getattr(residual_cfg, "enabled", False)
+        ):
+            return
+        from axolotl.kernels.nvfp4_residual import ResidualConfig, attach_residual
+
+        cfg = ResidualConfig(
+            enabled=True,
+            rank=int(getattr(residual_cfg, "rank", 32)),
+            calibration=str(getattr(residual_cfg, "calibration", "activation")),
+            calib_tokens=int(getattr(residual_cfg, "calib_tokens", 512)),
+        )
+        lm_head = model.get_output_embeddings()
+        teacher_w = getattr(lm_head, "_distill_teacher_w", None)
+        if teacher_w is None:
+            LOG.warning(
+                "lm_head_residual: bf16 teacher weight not retained; cannot build "
+                "the residual. Skipping."
+            )
+            return
+
+        calib_hidden = None
+        if cfg.calibration == "activation":
+            calib_hidden = self._nvfp4_capture_calib_hidden(model, cfg.calib_tokens)
+
+        attach_residual(lm_head, teacher_w, cfg, calib_hidden)
+        LOG.info(
+            "NVFP4 lm_head_residual enabled (rank=%d, calibration=%s)",
+            cfg.rank,
+            cfg.calibration,
+        )
+
+    def _nvfp4_prepare_base_residual(self, model, exclude, base_mode: str):
+        """Pre-swap activation calibration for the frozen-base L2QER residual.
+
+        ``nvfp4_training.base_residual`` is ON by default: whenever the LoRA/QLoRA
+        swap is about to freeze base linears on the FP4 grid, capture — with
+        forward pre-hooks on every base linear that will be swapped — the
+        per-input-channel running mean of x^2 over ONE short forward of the
+        still-bf16 model (token source shared with the lm_head calibration).
+        Must run BEFORE ``convert_lora_base_to_nvfp4``: the storage mode discards
+        the bf16 master the quant error is computed from.
+
+        Returns a ``BaseResidualPlan`` for the converter, or ``None`` (disabled).
+        Per the measured finding (plain SVD is useless on the near-full-rank e2m1
+        error), an UNAVAILABLE activation calibration disables the residual with
+        a loud warning instead of silently degrading to plain SVD.
+        """
+        import torch.nn as nn
+
+        nvfp4 = self.cfg.nvfp4_training
+        br = getattr(nvfp4, "base_residual", None)
+        # Missing block == schema default == enabled (the explicit product
+        # decision: it should just happen when frozen FP4 base linears exist).
+        enabled = getattr(br, "enabled", None) if br is not None else None
+        if enabled is None:
+            enabled = True
+        if not enabled:
+            LOG.debug("nvfp4 base_residual: disabled by config")
+            return None
+        if base_mode not in ("storage", "compute"):
+            LOG.debug(
+                "nvfp4 base_residual: base_mode=%s keeps a high-precision master "
+                "(no frozen FP4 store to correct); skipping.",
+                base_mode,
+            )
+            return None
+        if not isinstance(model, nn.Module):
+            return None
+
+        from peft.tuners.lora import Linear as LoraLinear
+
+        from axolotl.utils.nvfp4_training import BaseResidualPlan, _is_swappable
+
+        rank = int(getattr(br, "rank", None) or 16) if br is not None else 16
+        calibration = (
+            str(getattr(br, "calibration", None) or "activation")
+            if br is not None
+            else "activation"
+        )
+        calib_tokens = (
+            int(getattr(br, "calib_tokens", None) or 512) if br is not None else 512
+        )
+
+        # The linears the converter will swap: frozen, swappable lora.Linear
+        # bases, minus the exclusions. lm_head is always excluded here — it has
+        # its own lm_head_residual block (and lm_head-sized rows need the
+        # streaming path the head machinery already covers).
+        targets = []
+        for name, module in model.named_modules():
+            if not isinstance(module, LoraLinear):
+                continue
+            if any(frag in name for frag in exclude) or "lm_head" in name:
+                continue
+            base = module.base_layer
+            if not isinstance(base, nn.Linear) or not _is_swappable(base):
+                continue
+            w = base.weight
+            if w is None or w.is_meta or w.requires_grad:
+                continue
+            targets.append((name, base))
+        if not targets:
+            LOG.debug("nvfp4 base_residual: no eligible frozen base linears")
+            return None
+        if calibration != "activation":
+            # Explicit ablation request: plain SVD per module (g=None).
+            LOG.warning(
+                "nvfp4 base_residual: calibration='svd' is an ablation — plain "
+                "SVD recovers almost none of the near-full-rank e2m1 error."
+            )
+            return BaseResidualPlan(rank=rank, calibration=calibration, calib={})
+
+        acc: dict = {}
+
+        def _make_hook(name):
+            def hook(_m, args):
+                x = args[0] if args else None
+                if not torch.is_tensor(x) or x.shape[-1] <= 0:
+                    return
+                h = x.detach().reshape(-1, x.shape[-1]).float()
+                ent = acc.get(name)
+                if ent is None:
+                    acc[name] = [h.pow(2).sum(0), h.shape[0]]
+                else:
+                    ent[0] += h.pow(2).sum(0)
+                    ent[1] += h.shape[0]
+
+            return hook
+
+        handles = [
+            base.register_forward_pre_hook(_make_hook(name)) for name, base in targets
+        ]
+        n_tok = 0
+        moved_from_cpu = False
+        try:
+            device = next(model.parameters()).device
+            run_device = device
+            if device.type == "cpu" and torch.cuda.is_available():
+                # The NVFP4 LoRA loader keeps the bf16 model on CPU (the swap
+                # streams it to the GPU layer by layer), but the calibration
+                # forward has to run on the GPU: flash-attention / Triton
+                # linear-attention kernels have no CPU path. Hop the model over
+                # for the ONE short no-grad forward and hop back, so the
+                # streaming swap still starts from CPU. The bf16 weights fit on
+                # the GPU long before a training step would (no optimizer/grad/
+                # activation state); if they don't, the OOM lands in the except
+                # below and the residual loudly disables as before.
+                run_device = torch.device("cuda")
+                model.to(run_device)
+                moved_from_cpu = True
+            ids = self._nvfp4_calib_input_ids(model, calib_tokens, run_device)
+            if ids is None:
+                raise RuntimeError("no calibration input_ids available")
+            n_tok = int(ids.numel())
+            was_training = model.training
+            model.eval()
+            # The fused-LoRA kernel patches (apply_qkv/apply_o, the
+            # GatedDeltaNet apply_<proj> helpers, the fused MLP instance
+            # forward) call the Triton kernels with raw weights — the hooked
+            # base nn.Linear modules never run under them, so the pre-hooks
+            # above would capture nothing. Reroute through the plain module
+            # forwards for this ONE short no-grad pass (numerics-equivalent;
+            # perf is irrelevant here).
+            from axolotl.monkeypatch.lora_kernels import plain_lora_module_forwards
+
+            with torch.no_grad(), plain_lora_module_forwards(model):
+                model(ids)
+            if was_training:
+                model.train()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            LOG.warning(
+                "nvfp4 base_residual: activation calibration unavailable (%s); "
+                "DISABLING the base residual (no plain-SVD fallback — it is "
+                "pointless on the near-full-rank e2m1 quant error).",
+                exc,
+            )
+            return None
+        finally:
+            for handle in handles:
+                handle.remove()
+            if moved_from_cpu:
+                model.to(torch.device("cpu"))
+                torch.cuda.empty_cache()
+
+        calib = {name: (s / max(count, 1)) for name, (s, count) in acc.items()}
+        if not calib:
+            LOG.warning(
+                "nvfp4 base_residual: calibration forward captured no activations; "
+                "DISABLING the base residual."
+            )
+            return None
+        missing = [name for name, _ in targets if name not in calib]
+        if missing:
+            LOG.warning(
+                "nvfp4 base_residual: %d/%d target linears captured no calibration "
+                "activations (e.g. %s); their residuals will be skipped.",
+                len(missing),
+                len(targets),
+                missing[0],
+            )
+        LOG.info(
+            "nvfp4 base_residual: calibrated %d frozen base linears over %d tokens "
+            "(rank=%d)",
+            len(calib),
+            n_tok,
+            rank,
+        )
+        return BaseResidualPlan(rank=rank, calibration="activation", calib=calib)
+
+    def _nvfp4_capture_calib_hidden(self, model, n_tokens: int):
+        """Capture ``[N, H]`` final-layer hidden states feeding the lm_head.
+
+        Forwards a short slice of the training dataset (or a synthetic token range
+        if none is reachable) through the model with a forward PRE-hook on the
+        lm_head module itself, capturing exactly the activations it consumes —
+        immune to how the wrapper packages model outputs (``ModelOutput``
+        subclasses without ``last_hidden_state``, e.g. the Qwen3.5 conditional
+        generation output, broke the old output-spelunking path). Falls back to
+        a forward hook on the model body when no output embedding module is
+        exposed. Best-effort: returns None on any failure, and the residual
+        falls back to plain SVD.
+        """
+        import torch
+
+        try:
+            device = next(model.parameters()).device
+            # Build a small input_ids batch: prefer a real train sample, else a
+            # deterministic token range (the second moment per hidden dim is robust
+            # to the exact tokens — it is dominated by the layernorm output scale).
+            ids = self._nvfp4_calib_input_ids(model, n_tokens, device)
+            if ids is None:
+                return None
+
+            captured = {}
+            get_out = getattr(model, "get_output_embeddings", None)
+            lm_head = get_out() if callable(get_out) else None
+            if lm_head is not None:
+                # Pre-hook on the head: args[0] is the hidden-state input,
+                # whatever the model's output wrapper looks like.
+                def pre_hook(_m, args):
+                    x = args[0] if args else None
+                    if torch.is_tensor(x):
+                        captured["h"] = x.detach()
+
+                handle = lm_head.register_forward_pre_hook(pre_hook)
+                fwd_target = model
+            else:
+                # Fallback: hook the model body output (legacy path for models
+                # without an exposed output embedding module).
+                base = getattr(model, "model", None) or getattr(
+                    getattr(model, "base_model", model), "model", None
+                )
+                if base is None:
+                    return None
+
+                def hook(_m, _inp, out):
+                    h = getattr(out, "last_hidden_state", None)
+                    if h is None:
+                        h = out[0] if isinstance(out, (tuple, list)) else out
+                    if torch.is_tensor(h):
+                        captured["h"] = h.detach()
+
+                handle = base.register_forward_hook(hook)
+                fwd_target = base
+
+            was_training = model.training
+            model.eval()
+            try:
+                with torch.no_grad():
+                    fwd_target(ids)
+            finally:
+                handle.remove()
+                if was_training:
+                    model.train()
+            h = captured.get("h")
+            return None if h is None else h.reshape(-1, h.shape[-1])
+        except Exception as e:  # best-effort calibration
+            LOG.warning(
+                "lm_head_residual: calibration capture failed (%s); plain SVD", e
+            )
+            return None
+
+    def _nvfp4_calib_input_ids(self, model, n_tokens: int, device):
+        """A ``[1, n]`` input_ids tensor for residual calibration, or None."""
+        import torch
+
+        ds = getattr(self, "train_dataset", None) or getattr(
+            getattr(self, "cfg", None), "_train_dataset", None
+        )
+        try:
+            if ds is not None and len(ds) > 0:
+                ids = ds[0].get("input_ids")
+                if ids is not None:
+                    t = torch.as_tensor(ids, device=device).reshape(1, -1)[:, :n_tokens]
+                    if t.shape[1] >= 2:
+                        return t
+        except Exception:
+            pass
+        # Fallback: a deterministic in-vocab token range.
+        vocab = getattr(getattr(model, "config", None), "vocab_size", None)
+        if not vocab:
+            return None
+        n = min(n_tokens, 256)
+        return (torch.arange(n, device=device) % vocab).reshape(1, n)
+
+    @staticmethod
+    def _nvfp4_attach_distillation(model, distill_cfg, retain_teacher: bool) -> None:
+        """Attach the KL-distillation state + forward patch to the FP4 head model.
+
+        No-op unless distillation is enabled and the bf16 teacher was retained on
+        the lm_head. The forward patch recomputes the (tiled) teacher logits and
+        adds ``lambda * T^2 * KL(teacher || student)`` to the loss; it is gated on
+        labels being present (training) and the head exposing both a retained
+        teacher and a tile-able FP4 student store.
+        """
+        if not (
+            retain_teacher
+            and distill_cfg is not None
+            and getattr(distill_cfg, "enabled", False)
+        ):
+            return
+        from axolotl.kernels.nvfp4_distill import (
+            DistillState,
+            patch_model_distillation,
+        )
+
+        state = DistillState(
+            enabled=True,
+            lambda_=float(getattr(distill_cfg, "lambda_", 1.0)),
+            temperature=float(getattr(distill_cfg, "temperature", 1.0)),
+            top_k=getattr(distill_cfg, "top_k", None),
+            cadence=int(getattr(distill_cfg, "cadence", 1)),
+            teacher=str(getattr(distill_cfg, "teacher", "live")),
+            vocab_block=int(getattr(distill_cfg, "teacher_vocab_block", 8192)),
+        )
+        patch_model_distillation(model, state)
+        LOG.info(
+            "NVFP4 lm_head_distillation enabled (lambda=%s, T=%s, top_k=%s, "
+            "cadence=%s, teacher=%s)",
+            state.lambda_,
+            state.temperature,
+            state.top_k,
+            state.cadence,
+            state.teacher,
+        )
+
+    @staticmethod
+    def _module_name(model: PreTrainedModel, target) -> str | None:
+        if target is None:
+            return None
+        return next((n for n, m in model.named_modules() if m is target), None)
 
     def _apply_chunked_cross_entropy_patch(self):
         if self.cfg.chunked_cross_entropy:

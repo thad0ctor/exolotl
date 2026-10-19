@@ -1,5 +1,6 @@
 """Module for patching custom LoRA Triton kernels and `torch.autograd` functions."""
 
+import contextlib
 import importlib
 import inspect
 import logging
@@ -150,6 +151,82 @@ def original_apply_o(self: nn.Module, hidden_states: torch.Tensor) -> torch.Tens
     attn_output = self.o_proj(hidden_states)
 
     return attn_output
+
+
+_PLAIN_FWD_MISSING = object()
+
+
+@contextlib.contextmanager
+def plain_lora_module_forwards(model: nn.Module):
+    """Temporarily reroute every fused-LoRA projection through the plain
+    (peft) module forwards, restoring the fused routing on exit.
+
+    The fused kernel patches call the Triton LoRA kernels with raw weights:
+    ``apply_qkv``/``apply_o`` on attention (the source-rewritten class forward
+    and the nvfp4 attention patch both route through them), the GatedDeltaNet
+    ``apply_<proj>`` helpers, and the instance-level fused MLP ``forward``.
+    The wrapped ``nn.Linear`` base modules never run under them, so
+    ``nn.Module`` forward (pre-)hooks never fire — which breaks load-time
+    activation calibration (the NVFP4 base/lm_head residuals hook the frozen
+    base linears).
+
+    Inside this context:
+      - instance ``apply_qkv``/``apply_o`` are rebound to the ORIGINAL
+        module-calling implementations (not removed: the source-rewritten
+        attention forward calls them unconditionally),
+      - the GatedDeltaNet ``apply_<proj>``/``apply_in_proj_fused`` helpers are
+        removed (the patched
+        modeling forward falls back to the exact plain module call),
+      - the fused MLP instance ``forward`` is removed so the class forward
+        (plain module calls) resumes,
+      - the ``_lora_batch_kernel`` sentinel is removed (it gates the nvfp4
+        attention patch's fused-QKV branch).
+
+    Numerics are equivalent — the fused kernels are exact rewrites of the
+    module path. The plain path re-introduces peft's hidden-state cast
+    round-trips, so only wrap short no-grad passes (e.g. calibration), never
+    a training step.
+    """
+    stashed: list[tuple[nn.Module, str, object]] = []
+
+    def _swap(module: nn.Module, attr: str, new):
+        stashed.append((module, attr, module.__dict__.get(attr, _PLAIN_FWD_MISSING)))
+        if new is _PLAIN_FWD_MISSING:
+            module.__dict__.pop(attr, None)
+        else:
+            module.__dict__[attr] = new
+
+    fused_mlp_fns = (apply_lora_mlp_swiglu, apply_lora_mlp_geglu, apply_lora_mlp_relu2)
+    for module in model.modules():
+        d = module.__dict__
+        inst_fwd = d.get("forward")
+        if (
+            inst_fwd is not None
+            and getattr(inst_fwd, "__func__", None) in fused_mlp_fns
+        ):
+            _swap(module, "forward", _PLAIN_FWD_MISSING)
+        if "apply_qkv" in d:
+            orig_qkv = (
+                original_apply_qkv_optional_v
+                if getattr(module, "v_proj", None) is None
+                else original_apply_qkv
+            )
+            _swap(module, "apply_qkv", types.MethodType(orig_qkv, module))
+        if "apply_o" in d:
+            _swap(module, "apply_o", types.MethodType(original_apply_o, module))
+        for attr in ("apply_in_proj_fused", *(f"apply_{p}" for p in LINEAR_ATTN_PROJS)):
+            if attr in d:
+                _swap(module, attr, _PLAIN_FWD_MISSING)
+        if "_lora_batch_kernel" in d:
+            _swap(module, "_lora_batch_kernel", _PLAIN_FWD_MISSING)
+    try:
+        yield
+    finally:
+        for module, attr, old in reversed(stashed):
+            if old is _PLAIN_FWD_MISSING:
+                module.__dict__.pop(attr, None)
+            else:
+                module.__dict__[attr] = old
 
 
 def get_attention_cls_from_config(cfg: DictDefault) -> Type[nn.Module]:
@@ -579,6 +656,7 @@ def apply_lora_kernel_patches(
                 )
 
                 if can_patch_qkv:
+                    self_attn._lora_batch_kernel = bool(cfg.lora_batch_kernel)
                     if has_v_proj:
                         self_attn.apply_qkv = types.MethodType(
                             apply_lora_qkv, self_attn
@@ -666,6 +744,7 @@ def apply_lora_kernel_patches(
                 )
 
                 if can_patch_mlp:
+                    mlp._lora_batch_kernel = bool(cfg.lora_batch_kernel)
                     apply_fn = APPLY_FN_MAPPING[activation]
                     mlp.forward = types.MethodType(apply_fn, mlp)
                 else:

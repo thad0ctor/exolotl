@@ -104,7 +104,7 @@ def do_cli(config: Union[Path, str] = Path("examples/"), **kwargs):
 
         load_cfg_fn = load_cfg
 
-    parsed_cfg = load_cfg_fn(config, **kwargs)
+    parsed_cfg = load_cfg_fn(config, axolotl_cli_mode="train", **kwargs)
     parser = parser_cls(TrainerCliArgs)
     parsed_cli_args, _ = parser.parse_args_into_dataclasses(
         return_remaining_strings=True

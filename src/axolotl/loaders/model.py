@@ -250,6 +250,7 @@ class ModelLoader:
         processor: ProcessorMixin | None = None,
         inference: bool = False,
         reference_model: bool = False,
+        train_dataset=None,
         **kwargs,
     ):
         """Initializes the ModelLoader.
@@ -262,6 +263,8 @@ class ModelLoader:
                 to False.
             reference_model: Whether this is a reference model (used in setups like DPO
                 training). Defaults to False.
+            train_dataset: Optional prepared (tokenized) training dataset, used by
+                load-time activation calibration (NVFP4 residuals). Defaults to None.
             **kwargs: Additional keyword arguments (ignored).
         """
         self.cfg = cfg
@@ -269,6 +272,7 @@ class ModelLoader:
         self.processor = processor
         self.inference: bool = inference
         self.reference_model: bool = reference_model
+        self.train_dataset = train_dataset
 
         # Init model kwargs
         self.model_kwargs: dict[str, Any] = {}
@@ -293,6 +297,7 @@ class ModelLoader:
             tokenizer=tokenizer,
             processor=self.processor,
             reference_model=reference_model,
+            train_dataset=train_dataset,
         )
 
     @cached_property
@@ -975,6 +980,20 @@ class ModelLoader:
             # For other FSDP cases, don't set device_map at all
         elif not is_ds_zero3:
             self.model_kwargs["device_map"] = device_map
+
+            # NVFP4 LoRA streams the base to FP4 during the post-load swap, so load
+            # it on CPU first: the full bf16 model never sits on the GPU (and
+            # device_map can't strand weights on meta on a model that nearly fills
+            # VRAM, which then can't be quantized). The swap moves the FP4 base and
+            # the rest of the model onto the GPU.
+            if (
+                self.cfg.nvfp4_training
+                and self.cfg.nvfp4_training.enabled
+                and self.cfg.adapter in ("lora", "qlora")
+            ):
+                # No device_map: a plain CPU load (no accelerate dispatch hooks to
+                # fight the swap's manual .to(cuda)).
+                self.model_kwargs.pop("device_map", None)
 
             # quantize_moe_experts quantizes expert weights on-the-fly during loading,
             # so the actual VRAM usage is much less than bf16 estimates.

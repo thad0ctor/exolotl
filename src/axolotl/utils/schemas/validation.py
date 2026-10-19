@@ -99,6 +99,15 @@ def lora_kernels_auto_enable(get: Callable[[str], Any]) -> bool:
     """
     if get("rl") or get("nvfp4_merge_aware"):
         return False
+    nvfp4 = get("nvfp4_training")
+    if nvfp4:
+        if isinstance(nvfp4, dict):
+            enabled, backend = nvfp4.get("enabled"), nvfp4.get("backend", "native")
+        else:
+            enabled, backend = nvfp4.enabled, nvfp4.backend
+        # te.Linear keeps a real .weight, so the fused kernels would silently run bf16
+        if enabled and backend == "te":
+            return False
     adapter = get("adapter")
     if adapter not in ("lora", "qlora"):
         return False
@@ -1482,6 +1491,19 @@ class OptimizationValidationMixin:
                 "liger_fused_linear_cross_entropy"
             ),
         }
+        nvfp4 = data.get("nvfp4_training") or {}
+        if isinstance(nvfp4, dict):
+            nvfp4_enabled = nvfp4.get("enabled")
+            fp8_lm_head_ce = nvfp4.get("fp8_lm_head_cross_entropy")
+            bf16_lm_head_ce = nvfp4.get("bf16_lm_head_cross_entropy")
+        else:
+            nvfp4_enabled = getattr(nvfp4, "enabled", None)
+            fp8_lm_head_ce = getattr(nvfp4, "fp8_lm_head_cross_entropy", None)
+            bf16_lm_head_ce = getattr(nvfp4, "bf16_lm_head_cross_entropy", None)
+        if nvfp4_enabled and fp8_lm_head_ce:
+            ce_options["nvfp4_training.fp8_lm_head_cross_entropy"] = True
+        if nvfp4_enabled and bf16_lm_head_ce:
+            ce_options["nvfp4_training.bf16_lm_head_cross_entropy"] = True
 
         enabled_options = [k for k, v in ce_options.items() if v]
 
