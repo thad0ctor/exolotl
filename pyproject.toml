@@ -32,6 +32,7 @@ dependencies = [
     "pydantic==2.13.5",
     "addict",
     "fire",
+    "filelock",
     "PyYAML==6.0.3",
     "requests",
     "wandb",

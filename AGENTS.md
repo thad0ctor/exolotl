@@ -41,6 +41,8 @@ axolotl merge-lora config.yaml         # Merge LoRA adapter into base model
 axolotl export config.yaml             # Export a trained model to GGUF (llama.cpp/Ollama)
 axolotl vllm-serve config.yaml         # Start vLLM server for GRPO/EBFT training
 axolotl fetch examples                 # Download example configs
+axolotl plugins install <url|path>     # Install an external plugin (explicit, never automatic)
+axolotl plugins list                   # List externally installed plugins
 axolotl agent-docs                     # Show agent-optimized docs (bundled with pip package)
 axolotl agent-docs grpo                # Topic-specific agent reference
 axolotl config-schema                  # Dump config JSON schema
@@ -65,6 +67,7 @@ Agent-specific references:
 - [docs/agents/pretraining.md](docs/agents/pretraining.md) — continual pretraining
 - [docs/agents/model_architectures.md](docs/agents/model_architectures.md) — model-specific quirks (Gemma4, Qwen3.5 MoE, etc.)
 - [docs/agents/new_model_support.md](docs/agents/new_model_support.md) — debugging and adding support for new model architectures
+- [docs/agents/plugins.md](docs/agents/plugins.md) — plugin hooks, `axolotl plugins install`, and referencing external plugins from a config
 
 ## Config Pattern
 

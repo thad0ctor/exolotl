@@ -28,6 +28,10 @@ BUILTIN_COMMANDS: dict[str, PluginCommand] = {
         target="axolotl.integrations.lm_eval.cli:lm_eval",
         short_help="use lm eval to evaluate a trained language model",
     ),
+    "plugins": PluginCommand(
+        target="axolotl.cli.plugin_manager:plugins",
+        short_help="install and manage external axolotl plugins",
+    ),
 }
 
 

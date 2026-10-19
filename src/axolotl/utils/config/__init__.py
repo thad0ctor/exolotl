@@ -15,6 +15,7 @@ from transformers.utils.import_utils import (
 )
 
 from axolotl.integrations.config import merge_input_args
+from axolotl.integrations.verification import verify_plugins
 from axolotl.loaders.constants import MULTIMODAL_AUTO_MODEL_MAPPING
 from axolotl.loaders.utils import load_model_config
 from axolotl.model_support import (
@@ -659,6 +660,9 @@ def prepare_plugins(cfg):
         get_builtin_plugins,
         normalize_plugin_name,
     )
+
+    # Rewrites mapping-form (external source) entries to dotted class paths.
+    verify_plugins(cfg)
 
     builtin_plugins = get_builtin_plugins()
     configured_plugins = tuple(
