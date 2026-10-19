@@ -536,6 +536,7 @@ website:
             - docs/nvfp4_lora.qmd
             - docs/1_58bit_finetuning.qmd
             - docs/optimizations.qmd
+            - docs/protrain/apex-fused-adam-install.qmd
 
         - section: "Core Concepts"
           contents:

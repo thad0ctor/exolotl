@@ -50,6 +50,7 @@ from axolotl.loaders.patch_manager import PatchManager
 from axolotl.loaders.utils import (
     get_linear_embedding_layers,
     get_module_class_from_name,
+    is_protrain_active,
     load_model_config,
     materialize_trainable_meta_params,
 )
@@ -613,8 +614,11 @@ class ModelLoader:
 
         # An upcast the conversion below would immediately revert is pure peak memory:
         # the `.to()` holds an fp32 and a `torch_dtype` copy of the embeddings at once.
+        # ProTrain upcasts embeddings lazily during forward; the load-time fp32 cast
+        # would OOM 27B + 4-bit on a 24 GiB card.
         upcast_embeddings = not should_convert and not (
-            self.cfg.load_in_4bit and self.cfg.embeddings_skip_upcast
+            self.cfg.load_in_4bit
+            and (self.cfg.embeddings_skip_upcast or is_protrain_active(self.cfg))
         )
         if upcast_embeddings or not self.is_fsdp_enabled:
             self._convert_embedding_modules_dtype(

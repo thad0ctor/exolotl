@@ -531,24 +531,36 @@ def find_lora_weights(
     """
     clean_key = key[:-7] if key.endswith(".weight") else key
 
-    # Try the direct key first
-    a_key = f"base_model.model.{clean_key}.lora_A.weight"
-    b_key = f"base_model.model.{clean_key}.lora_B.weight"
+    def key_variants(candidate: str) -> list[str]:
+        variants = [candidate]
+        seen = {candidate}
+        for match in re.finditer(r"\.\d+\.", candidate):
+            variant = candidate[: match.end()] + "block." + candidate[match.end() :]
+            if variant not in seen:
+                variants.append(variant)
+                seen.add(variant)
+        return variants
 
-    lora_a = lora_state.get(a_key)
-    lora_b = lora_state.get(b_key)
+    # Try the direct key first.
+    for candidate in key_variants(clean_key):
+        a_key = f"base_model.model.{candidate}.lora_A.weight"
+        b_key = f"base_model.model.{candidate}.lora_B.weight"
 
-    if lora_a is not None and lora_b is not None:
-        return lora_a, lora_b
+        lora_a = lora_state.get(a_key)
+        lora_b = lora_state.get(b_key)
+
+        if lora_a is not None and lora_b is not None:
+            return lora_a, lora_b
 
     # Try renamed keys (checkpoint format → runtime format)
     for renamed_key in _renamed_key_candidates(clean_key, weight_renamings):
-        a_key = f"base_model.model.{renamed_key}.lora_A.weight"
-        b_key = f"base_model.model.{renamed_key}.lora_B.weight"
-        lora_a = lora_state.get(a_key)
-        lora_b = lora_state.get(b_key)
-        if lora_a is not None and lora_b is not None:
-            return lora_a, lora_b
+        for candidate in key_variants(renamed_key):
+            a_key = f"base_model.model.{candidate}.lora_A.weight"
+            b_key = f"base_model.model.{candidate}.lora_B.weight"
+            lora_a = lora_state.get(a_key)
+            lora_b = lora_state.get(b_key)
+            if lora_a is not None and lora_b is not None:
+                return lora_a, lora_b
 
     return None, None
 
@@ -999,16 +1011,29 @@ def _find_dora_magnitude(
     Find DoRA magnitude vector for a given key.
     """
     clean_key = key[:-7] if key.endswith(".weight") else key
-    mag_key = f"base_model.model.{clean_key}.lora_magnitude_vector"
-    result = lora_state.get(mag_key)
-    if result is not None:
-        return result
 
-    for renamed_key in _renamed_key_candidates(clean_key, weight_renamings):
-        mag_key = f"base_model.model.{renamed_key}.lora_magnitude_vector"
+    def key_variants(candidate: str) -> list[str]:
+        variants = [candidate]
+        seen = {candidate}
+        for match in re.finditer(r"\.\d+\.", candidate):
+            variant = candidate[: match.end()] + "block." + candidate[match.end() :]
+            if variant not in seen:
+                variants.append(variant)
+                seen.add(variant)
+        return variants
+
+    for candidate in key_variants(clean_key):
+        mag_key = f"base_model.model.{candidate}.lora_magnitude_vector"
         result = lora_state.get(mag_key)
         if result is not None:
             return result
+
+    for renamed_key in _renamed_key_candidates(clean_key, weight_renamings):
+        for candidate in key_variants(renamed_key):
+            mag_key = f"base_model.model.{candidate}.lora_magnitude_vector"
+            result = lora_state.get(mag_key)
+            if result is not None:
+                return result
 
     return None
 

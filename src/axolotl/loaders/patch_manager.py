@@ -20,6 +20,7 @@ from transformers import (
 )
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
 
+from axolotl.loaders.utils import is_protrain_active
 from axolotl.model_support import (
     ModelHookContext,
     ModelHookPhase,
@@ -496,7 +497,9 @@ class PatchManager:
         """Apply patches for adapter configurations."""
         from axolotl.loaders.model import should_skip_peft_embedding_upcast
 
-        if should_skip_peft_embedding_upcast(self.cfg):
+        if should_skip_peft_embedding_upcast(self.cfg) or (
+            self.cfg.adapter and is_protrain_active(self.cfg)
+        ):
             from axolotl.loaders.utils import get_linear_embedding_layers
             from axolotl.monkeypatch.peft.utils import patch_peft_prep_code
 
