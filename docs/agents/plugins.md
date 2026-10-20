@@ -106,9 +106,9 @@ Subclass `BasePlugin` (`src/axolotl/integrations/base.py`) and override only the
 ```python
 from axolotl.integrations.base import BasePlugin
 
+
 class MyPlugin(BasePlugin):
-    def register(self, cfg):
-        ...
+    def register(self, cfg): ...
 ```
 
 ## Gotchas

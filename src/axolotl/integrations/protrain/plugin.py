@@ -397,7 +397,7 @@ def _remeasure_nccl_and_research(wrapped) -> tuple[bool, bool]:
                         f"rank={rank} got cfg={boot_result.cfg}, "
                         f"block_map_len={len(boot_result.block_map)}; "
                         f"rank0 got cfg={rank0_cfg}, "
-                        f"block_map_len={len(rank0_block_map)}. "
+                        f"block_map_len={len(rank0_block_map or ())}. "
                         "On mixed-SKU rigs this is usually per-rank "
                         "measure_compute_rate outliers flipping the cost "
                         "model's 1%-noise-band tie-breaker. PR #20 "

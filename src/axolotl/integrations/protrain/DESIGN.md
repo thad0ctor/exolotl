@@ -143,16 +143,21 @@ All live in `types.py`. Fields expand during M1–M4:
 ```python
 @dataclass(frozen=True)
 class ProfilerTrace:
-    op_order: list[OpRecord]                  # per-op: id, module_path, shape_sig
-    intra_op_delta: dict[OpId, int]           # bytes
-    inter_op_delta: dict[OpId, int]           # bytes
+    op_order: list[OpRecord]  # per-op: id, module_path, shape_sig
+    intra_op_delta: dict[OpId, int]  # bytes
+    inter_op_delta: dict[OpId, int]  # bytes
     activation_sizes: dict[BlockId, int]
     model_state_bytes: int
     pcie_h2d_bps: float
     pcie_d2h_bps: float
     nccl_gather_s: dict[int, float]
     nccl_reduce_s: dict[int, float]
-    arch_hash: str; bs: int; seq: int; sku: str; world: int
+    arch_hash: str
+    bs: int
+    seq: int
+    sku: str
+    world: int
+
 
 @dataclass(frozen=True)
 class ChunkLayout:
@@ -162,15 +167,20 @@ class ChunkLayout:
     param_to_chunk: dict[ParamId, int]
     block_to_chunks: dict[BlockId, list[int]]
 
+
 BlockStrategyMap = dict[int, BlockMode]
+
 
 @dataclass(frozen=True)
 class CostConfig:
-    n_persist: int       # chunks pinned on GPU
-    n_buffer: int        # pre-allocated chunk buffers
-    n_swap: int          # blocks using activation swap
-    n_checkpoint: int    # blocks using gradient checkpointing
-    n_offload: int = 0   # blocks using BlockMode.OFFLOAD (Option B; see BLOCK_MODE_OFFLOAD_DESIGN.md)
+    n_persist: int  # chunks pinned on GPU
+    n_buffer: int  # pre-allocated chunk buffers
+    n_swap: int  # blocks using activation swap
+    n_checkpoint: int  # blocks using gradient checkpointing
+    n_offload: int = (
+        0  # blocks using BlockMode.OFFLOAD (Option B; see BLOCK_MODE_OFFLOAD_DESIGN.md)
+    )
+
 
 @dataclass(frozen=True)
 class SearchResult:

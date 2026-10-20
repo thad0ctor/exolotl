@@ -301,6 +301,7 @@ def _residual_fold_factors(
     if res is None:
         return None
     a, b = res
+    assert s is not None
     compiling = torch.compiler.is_compiling()
     key = (dgrad, float(s), dtype)
     if not compiling:
@@ -408,6 +409,7 @@ def _dx_addmm(
     :func:`_lora_residual_pair`) so its net scale is 1.
     """
     if ext is not None:
+        assert pair is not None
         dX.addmm_(ext, pair[0], alpha=s)
     else:
         dX.addmm_(grad_B, A, alpha=s)
@@ -578,6 +580,7 @@ def matmul_lora(
         # into the adapter GEMMs below (it has exactly the LoRA shape) instead
         # of paying the base helper's separate [M, out] accumulation pass.
         if not defer_residual and A is not None:
+            assert s is not None
             if X_drop is None:
                 if nvfp4_dgrad:
                     # dgrad call (LoRA_MLP down backward): the saved matrices

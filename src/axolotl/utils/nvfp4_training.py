@@ -3138,7 +3138,7 @@ def convert_lora_base_to_nvfp4(
     else:
         mode = "hp"
     LOG.info("NVFP4 training: swapped %d LoRA base layers (mode=%s)", swapped, mode)
-    if res_stats["n"]:
+    if res_stats["n"] and base_residual is not None:
         LOG.info(
             "NVFP4 base_residual: attached rank-%d L2QER residuals to %d frozen "
             "base linears (SVD total %.1fs, A/B buffers %.2f MiB)",

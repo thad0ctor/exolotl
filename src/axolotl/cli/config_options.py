@@ -1249,6 +1249,18 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         "Clean encoder autoregressive-loss coefficient.",
     ),
     (
+        ("--axolotl-cli-mode",),
+        None,
+        None,
+        "Internal CLI mode used for mode-specific validation.",
+    ),
+    (
+        ("--model-config-type",),
+        None,
+        None,
+        "Internal model type resolved from the HF config.",
+    ),
+    (
         ("--strict/--no-strict",),
         None,
         None,
@@ -1288,7 +1300,7 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         ("--embeddings-skip-upcast/--no-embeddings-skip-upcast",),
         None,
         None,
-        "Don't upcast the embeddings to float32 when using PEFT. Useful for low-VRAM GPUs",
+        "Don't upcast the embeddings to float32 when using PEFT. Useful for low-VRAM GPUs. Auto-enabled when ProTrain is in `plugins` (ProTrain upcasts embed/lm_head lazily during forward), so this knob is no longer required for 27B + 4-bit on a single 3090.",
     ),
     (
         ("--reinit-weights/--no-reinit-weights",),
@@ -2133,6 +2145,18 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         "Keep dataset in memory while preprocessing. Only needed if cached dataset is taking too much storage",
     ),
     (
+        ("--dataset-map-batch-size",),
+        None,
+        None,
+        "Rows per batched tokenization call while preprocessing. Defaults to 1000, or 32 for multimodal datasets whose rows carry large pixel_values. Lower this to reduce peak RAM.",
+    ),
+    (
+        ("--dataset-writer-batch-size",),
+        None,
+        None,
+        "Rows each tokenization worker buffers in RAM before flushing to the Arrow cache while preprocessing. Defaults to 1000, or 32 for multimodal datasets. Lower this to reduce peak RAM.",
+    ),
+    (
         ("--dataloader-pin-memory/--no-dataloader-pin-memory",),
         None,
         None,
@@ -2347,6 +2371,204 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         None,
         None,
         "Enable FSDP float8 all-gather optimization for FP8 training. Can improve training speed by 10-15% when FSDP is enabled.",
+    ),
+    (
+        ("--nvfp4-training.enabled/--no-nvfp4-training.enabled",),
+        "nvfp4_training__enabled",
+        None,
+        "Enable NVFP4-GEMM training (real FP4 forward/backward GEMMs). Blackwell-only. The speedup only materializes under torch.compile.",
+    ),
+    (
+        ("--nvfp4-training.backend",),
+        "nvfp4_training__backend",
+        None,
+        "FP4 compute backend. 'native' (default): our torch._scaled_mm module-swap; runs the full SR+RHT convergence recipe on any FP4-capable GPU (sm_100/sm_120), no extra build. 'te': NVIDIA Transformer Engine NVFP4BlockScaling; faster hand-tuned kernels, but needs `pip install axolotl[transformer-engine]` (source build) and on consumer Blackwell (sm_120) its RHT/SR kernels do not run \u2014 TE there is recipe-less (convergence unproven). Supports FFT and LoRA/QLoRA, but on adapter paths it keeps a high-precision base (ignores base_mode/quantize_base, so no FP4-storage saving) and is incompatible with the fused LoRA kernels.",
+    ),
+    (
+        (
+            "--nvfp4-training.stochastic-rounding/--no-nvfp4-training.stochastic-rounding",
+        ),
+        "nvfp4_training__stochastic_rounding",
+        None,
+        "Stochastic rounding on gradient operands (NVFP4Recipe).",
+    ),
+    (
+        ("--nvfp4-training.hadamard/--no-nvfp4-training.hadamard",),
+        "nvfp4_training__hadamard",
+        None,
+        "Random Hadamard transform on wgrad inputs (NVFP4Recipe).",
+    ),
+    (
+        ("--nvfp4-training.quantize-base/--no-nvfp4-training.quantize-base",),
+        "nvfp4_training__quantize_base",
+        None,
+        "Adapter modes only. When false (LoRA + FP4 compute): the frozen base weight stays high-precision and only the GEMM operands are FP4 \u2014 a throughput win, no memory saving. When true (NVFP4-QLoRA): the frozen base weight is stored packed in FP4 (~3.5x weight memory saving), replacing bnb NF4 storage. This is the FP4 equivalent of QLoRA, so it conflicts with load_in_4bit/load_in_8bit (drop those). `adapter: qlora` implies this (qlora == quantized base intent).",
+    ),
+    (
+        ("--nvfp4-training.base-mode",),
+        "nvfp4_training__base_mode",
+        None,
+        "Adapter modes only; overrides quantize_base when set. 'compute' (recommended): the frozen base is pre-quantized once into two NVFP4 layouts so fprop+dgrad run as pure FP4 GEMMs with no per-step base quant prologue \u2014 fastest base compute, ~1.75x weight memory. 'storage' (== NVFP4-QLoRA): base packed in FP4, ~3.5x memory, backward dequants to bf16 (max memory, modest speed). 'hp': base kept high-precision, re-quantized each step (FP4 GEMM, no memory win).",
+    ),
+    (
+        ("--nvfp4-training.exclude-modules",),
+        "nvfp4_training__exclude_modules",
+        None,
+        "Module name fragments kept in high precision (not swapped).",
+    ),
+    (
+        ("--nvfp4-training.quantize-lm-head/--no-nvfp4-training.quantize-lm-head",),
+        "nvfp4_training__quantize_lm_head",
+        None,
+        "Remove lm_head from the high-precision exclusion and quantize the output projection to NVFP4 (memory + GEMM win on a large [vocab, hidden] tensor), at a small convergence cost (the NVFP4 paper keeps lm_head bf16). OFF by default. With UNtied embeddings only the lm_head is quantized (embed_tokens stays excluded unless quantize_embeddings is also set). With TIED embeddings (the frozen shared weight) the shared weight is quantized ONCE and routed to both the embedding lookup and the lm_head GEMM. A TRAINABLE tied weight still RAISES (FP4-storing it would corrupt training).",
+    ),
+    (
+        (
+            "--nvfp4-training.fused-fp4-cross-entropy/--no-nvfp4-training.fused-fp4-cross-entropy",
+        ),
+        "nvfp4_training__fused_fp4_cross_entropy",
+        None,
+        "Requires quantize_lm_head. Fuse the FP4 lm_head projection with the cross-entropy loss so the full [batch*seq, vocab] logit tensor is never materialized (~1 GiB at vocab 152k / seq 8k): the loss is computed by tiling over the vocab, dequantizing each FP4 weight tile on read, and accumulating logsumexp in fp32 (like cut_cross_entropy, but reading the NVFP4-packed weight directly). This is a MEMORY win (no logit materialization), not an FP4-GEMM throughput win \u2014 the per-tile matmul runs in bf16/fp32, so the lm_head does not hit FP4 tensor cores. Frozen lm_head only (returns dL/dhidden, no weight grad). Falls back to the materialized path if the lm_head store isn't row-sliceable (MSLK-swizzled scales) or carries a bias. OFF by default.",
+    ),
+    (
+        ("--nvfp4-training.fused-ce-vocab-block",),
+        "nvfp4_training__fused_ce_vocab_block",
+        "int",
+        "Vocab-tile width for fused_fp4_cross_entropy. The fused CE streams the vocabulary in [tokens, fused_ce_vocab_block] tiles; this is a pure speed<->VRAM dial and is loss-invariant (the tile loop is a reduction split, so loss/grad are bit-stable across block widths). 4096 (default) is balanced \u2014 lighter than a bf16 head's transient logit tile while still faster. 8192 is max throughput (~+0.4% speed for ~+2 GiB peak at long seq); wider buys nothing. Overridable at runtime via the AXOLOTL_NVFP4_FUSED_CE_VOCAB_BLOCK env var (env wins over this config). Only affects fused_fp4_cross_entropy.",
+    ),
+    (
+        (
+            "--nvfp4-training.bf16-lm-head-cross-entropy/--no-nvfp4-training.bf16-lm-head-cross-entropy",
+        ),
+        "nvfp4_training__bf16_lm_head_cross_entropy",
+        None,
+        "Patch a plain frozen bias-free nn.Linear lm_head training forward to compute cross-entropy by tiling over the vocab in bf16, avoiding full [batch*seq, vocab] logits materialization (~1 GiB at vocab 152k / seq 8k) and the matching logits-gradient GEMM. The per-tile lm_head matmul runs in plain bf16 (bit-for-bit the same arithmetic as the materialized hidden @ W.t()); logsumexp/softmax and the dL/dhidden accumulation are kept in fp32. This is the exact tiled CE gradient (no low-probability vocab filtering), so it is convergence-safe under NVFP4 stochastic-rounding grads where the fused cut_cross_entropy / Liger paths collapsed. Returns dL/dhidden only (no lm_head weight grad). Incompatible with quantize_lm_head, fused_fp4_cross_entropy, and the FP8 cross-entropy patch. This is a MEMORY/backward-traffic win, not an FP4 tensor-core throughput win. OFF by default.",
+    ),
+    (
+        ("--nvfp4-training.fp8-lm-head/--no-nvfp4-training.fp8-lm-head",),
+        "nvfp4_training__fp8_lm_head",
+        None,
+        "Patch a plain frozen lm_head to use torch FP8 scaled matmul in eval/no-grad forward only. Training forwards still use the original high-precision Linear. This is for eval/scoring/logprob throughput; greedy generation can diverge after the first changed argmax token. OFF by default.",
+    ),
+    (
+        (
+            "--nvfp4-training.fp8-lm-head-cross-entropy/--no-nvfp4-training.fp8-lm-head-cross-entropy",
+        ),
+        "nvfp4_training__fp8_lm_head_cross_entropy",
+        None,
+        "Patch a plain frozen bias-free nn.Linear lm_head training forward to compute cross-entropy with FP8 scaled-matmul vocab tiles, avoiding full [batch*seq, vocab] logits materialization. Returns dL/dhidden only (no lm_head weight grad); backward uses FP8 scaled matmul against a prepacked dgrad weight layout. Incompatible with quantize_lm_head, fused_fp4_cross_entropy, and other cross-entropy optimization patches. OFF by default.",
+    ),
+    (
+        ("--nvfp4-training.fp8-lm-head-granularity",),
+        "nvfp4_training__fp8_lm_head_granularity",
+        None,
+        "Scaling granularity for fp8_lm_head. Rowwise keeps one scale per vocab row and had the best Qwen3.5 real-hidden-state argmax parity in the validation sweep; it is also the validated FP8 CE training default.",
+    ),
+    (
+        (
+            "--nvfp4-training.fused-fp4-cross-entropy-fp4-matmul/--no-nvfp4-training.fused-fp4-cross-entropy-fp4-matmul",
+        ),
+        "nvfp4_training__fused_fp4_cross_entropy_fp4_matmul",
+        None,
+        "Experimental. When fused_fp4_cross_entropy is enabled, use per-tile FP4 torch._scaled_mm for lm_head logits before the tiled online logsumexp. This hits Blackwell FP4 tensor cores for the matmul, but still materializes each [tokens, vocab_block] tile and still uses a dequantized weight tile for dhidden in backward. Early microbenchmarks show it is faster than the memory-only FP4 CE path but slower than materialized bf16/Liger CE; keep this off unless benchmarking the next native CE-epilogue design.",
+    ),
+    (
+        ("--nvfp4-training.lm-head-distillation",),
+        "nvfp4_training__lm_head_distillation",
+        None,
+        "KL-distillation aux-loss against the original bf16 head, to recover the accuracy the frozen FP4 lm_head loses. Only activates with quantize_lm_head. OFF by default. See LMHeadDistillationConfig.",
+    ),
+    (
+        ("--nvfp4-training.lm-head-residual",),
+        "nvfp4_training__lm_head_residual",
+        None,
+        "Low-rank bf16 residual correction A@B on the frozen FP4 lm_head (W ~= Q(W) + A B), computed once at load. Activation-weighted (L2QER) by default; recovers ~57% of the FP4-head KL gap at rank 16 on a Qwen3-8B head. Only activates with quantize_lm_head. OFF by default. PERMANENT inference cost (~10-15% of the head forward when fused). See LMHeadResidualConfig.",
+    ),
+    (
+        ("--nvfp4-training.base-residual",),
+        "nvfp4_training__base_residual",
+        None,
+        "Low-rank bf16 L2QER residual A@B on EVERY frozen FP4 base linear (W ~= Q(W) + A B), built at swap time from the bf16 master and a one-shot activation calibration. ON by default (measured: KL -27% at rank 16 on a Qwen3-0.6B body for +16-22% whole-model fwd+bwd at that scale; exact dgrad, no wgrad); applies to LoRA/QLoRA storage/compute base modes only \u2014 full-FT/hp bases and the lm_head (own lm_head_residual block) are excluded. Disabled with a loud warning if the activation calibration cannot be captured. See BaseResidualConfig.",
+    ),
+    (
+        (
+            "--nvfp4-training.quantize-embeddings/--no-nvfp4-training.quantize-embeddings",
+        ),
+        "nvfp4_training__quantize_embeddings",
+        None,
+        "Store the input token embedding (embed_tokens) packed in FP4 and dequantize on lookup (W4A16; the lookup gathers rows, no activation quant). FROZEN only \u2014 a trainable embedding is skipped with a warning (no FP4 master for gradients). Hidden dim must be %16. OFF by default.",
+    ),
+    (
+        (
+            "--nvfp4-training.quantize-vision-tower/--no-nvfp4-training.quantize-vision-tower",
+        ),
+        "nvfp4_training__quantize_vision_tower",
+        None,
+        "Multimodal only. Swap the FROZEN nn.Linear layers under the vision encoder (attn qkv/proj, mlp fc1/fc2) to the NVFP4 frozen base. The vision merger and patch-embed projection are left untouched, as are %32-ineligible dims. Warns if no vision tower is found (text model). OFF by default.",
+    ),
+    (
+        ("--nvfp4-training.fuse-rmsnorm/--no-nvfp4-training.fuse-rmsnorm",),
+        "nvfp4_training__fuse_rmsnorm",
+        None,
+        "Default off (throughput benefit is within noise; under torch.compile the reuse cache is bypassed). Fuse decoder RMSNorm with the NVFP4 activation quant in one Triton kernel so the qkv/gate-up base linears reuse the norm's pre-quantized activation. Auto-detects the gamma convention (plain `weight` vs zero-centered `1 + weight`) per norm and verifies each swap against the original before committing (reverts on mismatch).",
+    ),
+    (
+        ("--nvfp4-training.fuse-qk-norm-rope/--no-nvfp4-training.fuse-qk-norm-rope",),
+        "nvfp4_training__fuse_qk_norm_rope",
+        None,
+        "Experimental, Qwen only. Monkeypatch qwen3/qwen3_5/qwen3_5_moe attention to fuse head-dim q_norm/k_norm with RoPE using the Gemma4 fused RMSNorm+RoPE Triton kernel. This removes the separate q/k RMSNorm and rotate_half/apply_rope materializations but leaves the attention matmul itself unchanged. OFF by default.",
+    ),
+    (
+        (
+            "--nvfp4-training.shared-lora-base-fprop/--no-nvfp4-training.shared-lora-base-fprop",
+        ),
+        "nvfp4_training__shared_lora_base_fprop",
+        None,
+        "Experimental, LoRA/QLoRA native backend only. For fused LoRA QKV/QK projections whose frozen base layers are pre-quantized NVFP4 compute/storage bases, quantize and pack the shared activation once and reuse it across the base fprops. Omitted/null uses the AXOLOTL_NVFP4_SHARED_BASE_FPROP environment fallback (default off); set true or false in YAML to make the choice explicit. On Qwen3.5-9B with only 8 full-attention layers this was below whole-step noise, but models with more full-attention LoRA layers may benefit.",
+    ),
+    (
+        (
+            "--nvfp4-training.fla-causal-conv-compile-boundary/--no-nvfp4-training.fla-causal-conv-compile-boundary",
+        ),
+        "nvfp4_training__fla_causal_conv_compile_boundary",
+        None,
+        "Deprecated no-op. The Qwen3.5/MoE packing patch now runs the FLA varlen kernels behind opaque custom ops that compile without graph breaks, so no separate causal_conv1d compile boundary is needed.",
+    ),
+    (
+        ("--nvfp4-training.skip-first-n-blocks",),
+        "nvfp4_training__skip_first_n_blocks",
+        "int",
+        "Keep the first N transformer blocks in high precision. The NVFP4 paper keeps ~15% of linear layers in bf16 (embeddings/lm_head plus the first ~2 and last ~8 blocks of a 12B model, weighted to the tail) for convergence; for a model with L blocks a reasonable default is skip_first_n_blocks=1 and skip_last_n_blocks~=round(0.13*L).",
+    ),
+    (
+        ("--nvfp4-training.skip-last-n-blocks",),
+        "nvfp4_training__skip_last_n_blocks",
+        "int",
+        "Keep the last N transformer blocks in high precision. See skip_first_n_blocks for the ~15% high-precision policy from the NVFP4 training paper (the tail blocks matter most).",
+    ),
+    (
+        ("--nvfp4-training.save-nvfp4/--no-nvfp4-training.save-nvfp4",),
+        "nvfp4_training__save_nvfp4",
+        None,
+        "Store eligible weights NVFP4-packed (qdata + scales) in a torch.save sidecar (nvfp4_packed.pt) on every checkpoint/final save, for ~3.5x smaller weight files. safetensors cannot serialize the FP4 tensor subclass, so the packed weights go to a sidecar and the bf16 weights are dropped from the safetensors shard. For FROZEN weights (LoRA/QLoRA base, lm_head, embeddings) the FP4 IS the faithful stored form \u2014 load-back is bit-exact. For FFT (NVFP4Linear keeps a bf16 master) this is LOSSY for resume: only the FP4 packing is kept, no bf16 master, so a save_nvfp4 FFT checkpoint is for storage/inference export, not exact resume. OFF by default (bf16 save, unchanged).",
+    ),
+    (
+        ("--nvfp4-training.attention",),
+        "nvfp4_training__attention",
+        None,
+        "Native-NVFP4 full-attention path settings (model-agnostic; applied where the architecture supports it). Replaces the deprecated flat qwen3_5_native_attention* flags.",
+    ),
+    (
+        ("--nvfp4-training.linear-attn/--no-nvfp4-training.linear-attn",),
+        "nvfp4_training__linear_attn",
+        None,
+        "Patch linear-attention (e.g. GatedDeltaNet) large projection GEMMs to native NVFP4 in no-grad forward/eval. Training forwards fall back to the original implementation.",
+    ),
+    (
+        ("--nvfp4-training.mlp/--no-nvfp4-training.mlp",),
+        "nvfp4_training__mlp",
+        None,
+        "Patch dense SwiGLU MLP GEMMs to native NVFP4 in no-grad forward/eval. Training forwards fall back to the original implementation.",
     ),
     (
         ("--bfloat16/--no-bfloat16",),
@@ -2681,10 +2903,28 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         None,
     ),
     (
+        ("--fp4-attention-qat/--no-fp4-attention-qat",),
+        None,
+        None,
+        "Quantization-aware training for FP4 attention (Attn-QAT, arXiv 2603.00040). Fake-quantizes the attention operands (Q, K, V and the softmax probabilities) to NVFP4 each step so the model learns to tolerate real FP4 attention at inference; all matmuls stay bf16 (accuracy feature, not speed \u2014 training stays ~bf16 cost). Independent of nvfp4_training; works on a bf16 base. v1 is eager-attention only. Off by default.",
+    ),
+    (
         ("--attn-implementation",),
         None,
         None,
-        "Attention backend. Canonical values: eager, sdpa, flash_attention_2, flash_attention_3, flash_attention_4, flash_attention_torch, flex_attention, varlen, xformers, sage, fp8. `varlen` is native full-sequence diffusion only. Hub-kernel paths (e.g. kernels-community/flash-attn3) are also accepted and passed through to transformers.",
+        "Attention backend. Canonical values: eager, sdpa, flash_attention_2, flash_attention_3, flash_attention_4, flash_attention_torch, flex_attention, varlen, xformers, sage, sage_fp4, fp8. `varlen` is native full-sequence diffusion only. Hub-kernel paths (e.g. kernels-community/flash-attn3) are also accepted and passed through to transformers. 'sage_fp4' is the SageAttention-3 FP4 microscaling attention (Blackwell sm_120, INFERENCE only).",
+    ),
+    (
+        ("--sage-fp4-attention.per-block-mean/--no-sage-fp4-attention.per-block-mean",),
+        "sage_fp4_attention__per_block_mean",
+        None,
+        "Subtract a per-128-block query mean before FP4 quantization (Sage-3 smoothing). On by default; matches the kernel's default and improves accuracy on outlier-heavy activations.",
+    ),
+    (
+        ("--sage-fp4-attention.allow-fallback/--no-sage-fp4-attention.allow-fallback",),
+        "sage_fp4_attention__allow_fallback",
+        None,
+        "When an input can't use the FP4 kernel (per-key padding, sliding window, custom softmax scale, or head_dim>=256) fall back to a high-precision kernel for a correct result (default): flash attention for dense causal/full masks (covers head_dim<=256, so Qwen3.5 causal prefill), SDPA only for masks flash can't represent. Set false to RAISE instead \u2014 useful when benchmarking to guarantee every call runs the FP4 kernel rather than silently degrading to high precision.",
     ),
     (
         ("--gemma4-hybrid-attn-impl/--no-gemma4-hybrid-attn-impl",),
@@ -2715,6 +2955,12 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         None,
         None,
         "Replace ``q_norm + apply_rotary_pos_emb`` (and the matching k path) with a single fused RMSNorm+RoPE Triton kernel launch. Currently implemented for Qwen3, Qwen3-MoE, Qwen3.5, and Qwen3.5-MoE full-attention layers; Gemma 4 always uses the fused path. GLM-4.7-Flash (glm4_moe_lite) fuses partial RoPE and MLA Q/K/V assembly instead; latent RMSNorms remain separate and cached decoding uses the original path. Disabled (None/False) falls back to the eager transformers implementation. Compile-safe via torch.library.triton_op \u2014 traces under torch.compile(fullgraph=True). Per-step wins are arch-dependent: ~+7-12% across sm_86 and sm_120. Combining with torch_compile=true is a clear win on sm_120 (+9% extra) but currently regresses on sm_86 due to Inductor autotune biases \u2014 flip them on independently and benchmark.",
+    ),
+    (
+        ("--vision-patch-embed-linear/--no-vision-patch-embed-linear",),
+        None,
+        None,
+        "Run the vision patch_embed Conv3d as its exact F.linear equivalent \u2014 faster and immune to the slow_conv_dilated3d fallback on cuDNN-less torch builds. Default on for supported Qwen/GLM VLMs; set false to keep the stock Conv3d forward.",
     ),
     (
         ("--experts-implementation",),
@@ -2775,6 +3021,12 @@ AXOLOTL_CONFIG_CLI_OPTIONS = (
         None,
         None,
         "Apply custom LoRA autograd function for embedding layers. See: https://docs.axolotl.ai/docs/lora_optims.html",
+    ),
+    (
+        ("--lora-batch-kernel/--no-lora-batch-kernel",),
+        None,
+        None,
+        "Batch the per-projection LoRA adapter GEMMs that share an input (q/k/v and gate/up) into a single concatenated matmul to cut tiny-kernel launch overhead. Opt-in; only affects the lora_qkv_kernel/lora_mlp_kernel fast path (no DoRA/dropout/lora_bias).",
     ),
     (
         ("--chunked-cross-entropy/--no-chunked-cross-entropy",),

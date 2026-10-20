@@ -158,6 +158,7 @@ def _teacher_pass(
         running_max = new_max
 
         if top_k is not None:
+            assert tk_vals is not None and tk_idx is not None
             # merge this tile's top-k into the running top-k (online selection)
             kt = min(top_k, hi - lo)
             t_vals, t_cols = z.topk(kt, dim=1)
