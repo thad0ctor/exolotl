@@ -498,7 +498,10 @@ def test_collator_resolves_relative_image_base_dir(smolvlm_processor, tmp_path):
     assert collator._resolve_image_source("rel/img.png") == str(
         tmp_path / "rel/img.png"
     )
-    assert collator._resolve_image_source("/abs/img.png") == "/abs/img.png"
+    inside = str(tmp_path / "abs/img.png")
+    assert collator._resolve_image_source(inside) == inside
+    with pytest.raises(ValueError, match="escapes image_base_dir"):
+        collator._resolve_image_source("/abs/img.png")
     assert (
         collator._resolve_image_source("https://host/img.png") == "https://host/img.png"
     )
