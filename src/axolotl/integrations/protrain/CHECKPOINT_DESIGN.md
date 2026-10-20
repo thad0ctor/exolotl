@@ -51,12 +51,13 @@ This was the originally flagged risk. Verified empirically:
   `step` into `self.state[p]` as ordinary CPU torch tensors
   (cpu_adam.py:144-160):
   ```python
-  state['step'] = 0
-  state['exp_avg'] = torch.zeros_like(p.data, dtype=state_dtype, device=device)
-  state['exp_avg_sq'] = torch.zeros_like(p.data, dtype=state_dtype, device=device)
+  state["step"] = 0
+  state["exp_avg"] = torch.zeros_like(p.data, dtype=state_dtype, device=device)
+  state["exp_avg_sq"] = torch.zeros_like(p.data, dtype=state_dtype, device=device)
   # ...
-  self.ds_opt_adam.adam_update(self.opt_id, state['step'], ...,
-                               state['exp_avg'], state['exp_avg_sq'])
+  self.ds_opt_adam.adam_update(
+      self.opt_id, state["step"], ..., state["exp_avg"], state["exp_avg_sq"]
+  )
   ```
 - The C++ extension (`ds_opt_adam`) mutates these tensors **in place**.
   No opaque internal state.

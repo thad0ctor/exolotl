@@ -571,9 +571,7 @@ class ProTrainOptimizerCheckpointCallback(TrainerCallback):
         finally:
             # 3. Synchronize preamble status across ranks; raises on
             # every rank if any rank had a setup error.
-            _allreduce_status_or_raise(
-                preamble_status, op="save (pre-save preamble)"
-            )
+            _allreduce_status_or_raise(preamble_status, op="save (pre-save preamble)")
 
         # 4. Broadcast rank-0's skip/abort decision to every rank.
         skip_decision = [skip]
@@ -619,6 +617,7 @@ Symmetric for load:
 ```python
 def install_load_hook(trainer, optim):
     original = trainer._load_optimizer_and_scheduler
+
     def _patched(checkpoint):
         original(checkpoint)
         if checkpoint is None:
@@ -634,6 +633,7 @@ def install_load_hook(trainer, optim):
         else:
             _load_phase2_replicated(optim, target, meta)
         _barrier_or_noop()
+
     trainer._load_optimizer_and_scheduler = _patched
 ```
 
