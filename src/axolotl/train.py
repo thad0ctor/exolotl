@@ -427,13 +427,15 @@ def save_trained_model(
         )
     elif cfg.local_rank == 0:
         protrain_state_dict = _protrain_state_dict_for_save(cfg, model)
+        save_kwargs = (
+            {"state_dict": protrain_state_dict}
+            if protrain_state_dict is not None
+            else {}
+        )
         if cfg.rl and cfg.adapter and not cfg.rl_adapter_ref_model:
-            trainer.model.save_pretrained(
-                cfg.output_dir,
-                state_dict=protrain_state_dict,
-            )
+            trainer.model.save_pretrained(cfg.output_dir, **save_kwargs)
 
-        model.save_pretrained(cfg.output_dir, state_dict=protrain_state_dict)
+        model.save_pretrained(cfg.output_dir, **save_kwargs)
         _normalize_protrain_saved_safetensors(cfg)
         metadata = getattr(model, "_axolotl_native_nvfp4_metadata", None)
         if metadata:
