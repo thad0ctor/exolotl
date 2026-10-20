@@ -27,7 +27,7 @@ class _ConfigSpy:
     """Minimal cfg-shaped object that supports both attribute access and ``get``.
 
     ``ModelLoader._configure_embedding_dtypes`` reads ``self.cfg`` via dotted
-    attribute access. Only the attributes it touches need to be present.
+    attribute access. Unset attributes read as ``None``, like ``DictDefault``.
     """
 
     _defaults = {"attn_needs_dtype_cast": False}
@@ -35,6 +35,11 @@ class _ConfigSpy:
     def __init__(self, **kwargs):
         self.__dict__.update(self._defaults)
         self.__dict__.update(kwargs)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return None
 
 
 class _StubLoader(ModelLoader):
@@ -152,7 +157,7 @@ def test_no_auto_defer_when_plugin_listed_but_disabled() -> None:
         load_in_4bit=True,
         embeddings_skip_upcast=None,
         model_config_type="llama",
-        adapter="qlora",
+        adapter=None,
         gradient_checkpointing=False,
         gradient_checkpointing_kwargs=None,
         flash_attention=False,
@@ -178,7 +183,7 @@ def test_existing_upcast_still_runs_without_protrain() -> None:
         load_in_4bit=True,
         embeddings_skip_upcast=None,
         model_config_type="llama",
-        adapter="qlora",
+        adapter=None,
         gradient_checkpointing=False,
         gradient_checkpointing_kwargs=None,
         flash_attention=False,
@@ -254,7 +259,7 @@ def test_no_skip_when_4bit_disabled_even_with_protrain() -> None:
         load_in_4bit=False,
         embeddings_skip_upcast=None,
         model_config_type="llama",
-        adapter="lora",
+        adapter=None,
         gradient_checkpointing=False,
         gradient_checkpointing_kwargs=None,
         flash_attention=False,
@@ -284,7 +289,7 @@ def test_patch_manager_fires_peft_patch_under_active_protrain(monkeypatch) -> No
     called: list[bool] = []
     monkeypatch.setattr(
         "axolotl.monkeypatch.peft.utils.patch_peft_prep_code",
-        lambda: called.append(True),
+        lambda *_args, **_kwargs: called.append(True),
     )
 
     pm = pm_mod.PatchManager.__new__(pm_mod.PatchManager)
@@ -292,7 +297,7 @@ def test_patch_manager_fires_peft_patch_under_active_protrain(monkeypatch) -> No
         adapter="qlora",
         plugins=[_PROTRAIN_PLUGIN_ID],
         protrain_auto_memory=True,
-        embeddings_skip_upcast=None,
+        embeddings_skip_upcast=False,
     )
     pm._apply_adapter_patches()
     assert called == [True]
@@ -307,7 +312,7 @@ def test_patch_manager_skips_peft_patch_when_plugin_listed_but_disabled(
     called: list[bool] = []
     monkeypatch.setattr(
         "axolotl.monkeypatch.peft.utils.patch_peft_prep_code",
-        lambda: called.append(True),
+        lambda *_args, **_kwargs: called.append(True),
     )
 
     pm = pm_mod.PatchManager.__new__(pm_mod.PatchManager)
@@ -315,7 +320,7 @@ def test_patch_manager_skips_peft_patch_when_plugin_listed_but_disabled(
         adapter="qlora",
         plugins=[_PROTRAIN_PLUGIN_ID],
         protrain_auto_memory=False,
-        embeddings_skip_upcast=None,
+        embeddings_skip_upcast=False,
     )
     pm._apply_adapter_patches()
     assert called == []
@@ -328,14 +333,14 @@ def test_patch_manager_skips_peft_patch_without_gate(monkeypatch) -> None:
     called: list[bool] = []
     monkeypatch.setattr(
         "axolotl.monkeypatch.peft.utils.patch_peft_prep_code",
-        lambda: called.append(True),
+        lambda *_args, **_kwargs: called.append(True),
     )
 
     pm = pm_mod.PatchManager.__new__(pm_mod.PatchManager)
     pm.cfg = _ConfigSpy(  # type: ignore[assignment]
         adapter="qlora",
         plugins=[],
-        embeddings_skip_upcast=None,
+        embeddings_skip_upcast=False,
     )
     pm._apply_adapter_patches()
     assert called == []
