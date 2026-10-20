@@ -126,16 +126,8 @@ class TestCacheBuildAndReload:
             env.entry, env.cfg, env.tokenizer, env.processor
         )
         assert len(ds) == 8
-        assert set(ds.column_names) >= {
-            "input_ids",
-            "labels",
-            "attention_mask",
-            "images",
-            "_mm_text",
-        }
-        # Sanity: labels mirror input_ids pre-collator (collator masks image ids later).
-        for ids, lbls in zip(ds[0:8]["input_ids"], ds[0:8]["labels"], strict=True):
-            assert list(ids) == list(lbls)
+        # The collator's processor re-tokenizes, so only its inputs are cached.
+        assert set(ds.column_names) == {"images", "_mm_text"}
 
         h = generate_pretraining_dataset_hash(
             env.cfg,
@@ -212,10 +204,6 @@ class TestCacheBuildAndReload:
         )
         torch_ds = ds.with_format("torch")
         row = torch_ds[0]
-        import torch
 
-        assert isinstance(row["input_ids"], torch.Tensor)
-        assert isinstance(row["labels"], torch.Tensor)
-        assert isinstance(row["attention_mask"], torch.Tensor)
         assert isinstance(row["images"], list)
         assert isinstance(row["_mm_text"], str)
