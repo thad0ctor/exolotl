@@ -71,6 +71,7 @@ from axolotl.utils.samplers import (
     MultipackBatchSampler,
     get_dataset_lengths,
 )
+from axolotl.utils.samplers.balanced import FIRST_FIT_DECREASING
 from axolotl.utils.samplers.utils import get_dataset_label_counts
 from axolotl.utils.schemas.fp8 import DEFAULT_FP8_RECIPE
 
@@ -418,7 +419,9 @@ class AxolotlTrainer(
             drop_last=True,
             num_processes=self.args.dataset_num_proc,
             mp_start_method=self.args.sample_packing_mp_start_method or "fork",
-            packing_strategy=self.args.sample_packing_strategy,
+            packing_strategy=getattr(
+                self.args, "sample_packing_strategy", FIRST_FIT_DECREASING
+            ),
         )
 
         len(sampler)
