@@ -622,8 +622,8 @@ class ModelLoader:
         # ProTrain upcasts embeddings lazily during forward; the load-time fp32 cast
         # would OOM 27B + 4-bit on a 24 GiB card.
         upcast_embeddings = not should_convert and not (
-            self.cfg.load_in_4bit
-            and (self.cfg.embeddings_skip_upcast or is_protrain_active(self.cfg))
+            self.cfg.embeddings_skip_upcast
+            or (self.cfg.load_in_4bit and is_protrain_active(self.cfg))
         )
         if upcast_embeddings or not self.is_fsdp_enabled:
             self._convert_embedding_modules_dtype(
